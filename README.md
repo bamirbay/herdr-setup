@@ -16,7 +16,7 @@ A Herdr window for working with coding agents:
 | `mods/review` | The right sidebar lists changed files. The review tab shows every file's diff in one scroll, with line comments sent to the agent |
 | `mods/work` | The PR pane, the Linear pane and the status bar badge. The badge polls GitHub and Linear and posts PR alerts |
 | `mods/my-tabs` | The tab bar, with **PRs** (a red dot when a PR needs you), **Linear** and **Changes** buttons on the right |
-| `mods/my-pane` | Each pane's header. On the right it shows the branch's Linear issue and PR. Its close button follows the `cmd-w` rules |
+| `mods/my-pane` | Each pane's header. After the name it shows the branch's Linear issue and PR. Its close button follows the `cmd-w` rules |
 | `keys.json` | Key bindings (see below) |
 | `extras/` | Pieces that live outside Herdr's folder (see Install) |
 
