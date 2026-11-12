@@ -209,12 +209,14 @@ export default class Review extends View {
         const status = await git(["status", "--porcelain=v1", "-z", "--no-renames", "--untracked-files=all"]);
         if (status.code !== 0) throw new Error(status.stderr);
         const head = await git(["rev-parse", "--verify", "HEAD"]);
-        // Branch mode compares with where this branch left origin's default branch.
+        // Branch mode compares with where this branch left its PR's base branch (stacked PRs), else origin's default.
         let base = null;
+        this.baseName = null;
         if (mode() === "branch" && head.code === 0) {
-          for (const ref of ["origin/HEAD", "origin/main"]) {
+          const prBase = this.pr?.data?.baseRefName;
+          for (const ref of [...(prBase ? [`origin/${prBase}`] : []), "origin/HEAD", "origin/main"]) {
             const r = await git(["merge-base", "HEAD", ref]);
-            if (r.code === 0) { base = r.stdout.trim(); break; }
+            if (r.code === 0) { base = r.stdout.trim(); this.baseName = ref === "origin/HEAD" ? "origin/main" : ref; break; }
           }
         }
         const target = base ?? "HEAD";
@@ -255,9 +257,9 @@ export default class Review extends View {
         this.baseNote = mode() === "branch" && !base ? "No origin/main to compare with: showing uncommitted changes" : null;
         this.commentsKey = `comments:${JSON.stringify([on, root])}`;
         this.watch(root, cx);
+        this.loadPR(root, on, context, cx); // both roles: the PR's base branch decides the file list too
         if (!tied()) return; // The sidebar lists files; only a review tab loads diffs.
         await this.loadAll(context);
-        this.loadPR(root, on, context, cx);
       } catch (e) { if (key() === context) this.error = String(e); }
       finally { this.loading = false; cx.notify(); }
     });
@@ -304,21 +306,27 @@ export default class Review extends View {
     if (this.only && !this.headers.has(this.only)) this.only = null;
   }
 
-  // The branch's PR for the header; gh is asked again on a branch change or after 2 minutes.
+  // The branch's PR (header link, base branch); gh is asked again on a branch change or after 2 minutes.
+  // A new base branch reloads the review against it.
   loadPR(root, on, context, cx) {
     if (this.prBusy) return;
     this.prBusy = true;
     cx.spawn(async (cx) => {
+      const before = this.pr?.data?.baseRefName ?? null;
       try {
         const branch = (await exec("git", [...READ, "branch", "--show-current"], { cwd: root, on })).stdout.trim();
         if (!branch || /^(main|master)$/.test(branch)) { if (key() === context) this.pr = null; return; }
         if (this.pr?.branch === branch && Date.now() - this.pr.at < 120000) return;
-        const r = await exec("gh", ["pr", "view", branch, "--json", "number,url,state"], { cwd: root, on }).catch(() => null);
+        const r = await exec("gh", ["pr", "view", branch, "--json", "number,url,state,baseRefName"], { cwd: root, on }).catch(() => null);
         // A failed gh call keeps the last answer for this branch.
         const last = this.pr?.branch === branch ? this.pr.data : null;
         if (key() === context) this.pr = { branch, at: Date.now(), data: r?.code === 0 ? JSON.parse(r.stdout) : r?.stderr?.includes("no pull requests") ? null : last };
       } catch { /* no PR link */ }
-      finally { this.prBusy = false; cx.notify(); }
+      finally {
+        this.prBusy = false;
+        if (key() === context && (this.pr?.data?.baseRefName ?? null) !== before && mode() === "branch") this.refresh(cx);
+        cx.notify();
+      }
     });
   }
 
@@ -632,7 +640,7 @@ export default class Review extends View {
           .on_click((_e, cx) => this.toggleOnly(cx)).child("one file · ⌘⇧E for all")))
         .when(add > 0, (e) => e.child(div().text_size(11).text_color(C.green).child(`+${add}`)))
         .when(del > 0, (e) => e.child(div().text_size(11).text_color(C.red).child(`−${del}`)))
-        .child(div().text_size(10.5).text_color(t.dim).child(mode() === "branch" ? "vs origin/main" : "uncommitted"))
+        .child(div().text_size(10.5).text_color(t.dim).child(mode() === "branch" ? `vs ${this.baseName ?? "origin/main"}` : "uncommitted"))
         .when(Boolean(pr), (e) => e.child(div().id("pr").px(6).py(1).rounded(4).border_1().border_color(t.border).text_size(11).cursor_pointer().hover((s) => s.bg(t.hover))
           .on_click(() => { exec("open", [pr.url]).catch(() => null); }).child(`PR #${pr.number}${pr.state === "OPEN" ? "" : ` · ${pr.state.toLowerCase()}`}`)))
         .child(div().flex_1())
