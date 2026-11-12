@@ -4,7 +4,30 @@
 
 import { View, div, image, svg } from "gpui-kit";
 import { v_flex, h_flex } from "gpui-base";
-import { agents, terminals, panes, focused, spaces, run, exec, home, theme, shared, setShared, setAgentOrder, openOverlay, closeOverlay, props, window, layout } from "herdr";
+import { agents, terminals, panes, focused, spaces, run, exec, home, theme, shared, setShared, setAgentOrder, openOverlay, closeOverlay, props, window, layout, nextCommand, notify } from "herdr";
+
+// cmd-w / cmd-shift-w (keys.json "layout:my-main"): a sub-agent's pane is parked, so it keeps running under its
+// parent; any other pane closes, except a space's last one: spaces close by hand.
+function closePane() {
+  const f = focused();
+  if (!f?.pane) return;
+  const term = f.terminal && terminals().find((k) => k.address === f.terminal);
+  if (term?.parent && term.state === "live") { run("terminal.park", { terminal: term.address }); return; }
+  const space = spaces().find((s) => s.id === f.space), tabs = new Set((space?.tabs ?? []).map((t) => t.id));
+  if (panes().filter((p) => tabs.has(p.tab)).length <= 1) { notify({ title: "Spaces close by hand", body: "This is the space's last pane.", level: "info" }); return; }
+  run("pane.close", { pane: f.pane });
+}
+
+// cmd-shift-s: the focused agent's newest sub-agent without a pane, opened to the right of the focused pane.
+function beside() {
+  const me = focused()?.terminal, shown = new Set(panes().map((p) => p.terminal));
+  // shortcut: addresses count up in base 36 (t9, ta, …, t1j), so the highest is the newest; use a start time if hc ls gets one.
+  const n = (a) => parseInt(a.replace(/^.*\//, "").slice(1), 36);
+  const kid = terminals().filter((k) => me && k.parent === me && k.state === "live" && !shown.has(k.address)).sort((a, b) => n(b.address) - n(a.address))[0];
+  if (kid) run("terminal.keep", { terminal: kid.address, place: "right" });
+  else notify({ title: "No sub-agent to open", body: "The focused agent has no running sub-agent without a pane.", level: "info" });
+}
+if (parseInt("1j", 36) <= parseInt("z", 36)) throw new Error("my-agents self-check failed");
 
 const LINEAR = "https://linear.app/tryprofound/issue/";
 // Linear links open in the Linear app, else the browser.
@@ -101,6 +124,14 @@ export default class Agents extends View {
     if (!this.pendingPins.length) localStorage.removeItem("pins");
     this.migratingPins = new Set();
     cx.timer.every(30000, (cx) => cx.notify());
+    cx.spawn(async (cx) => {
+      for (;;) {
+        const command = (await nextCommand()).split(/[.:]/).pop();
+        if (command === "close") closePane();
+        if (command === "beside") beside();
+        cx.notify();
+      }
+    });
   }
 
   // Stamps agents whose state changed. Done and idle count as one: looking at a
@@ -279,12 +310,17 @@ export default class Agents extends View {
       .text_size(12.5)
       .when(on, (el) => el.bg(t.raised))
       .hover((s) => s.bg(t.hover))
+      .on_hover((over, cx) => { if (over) this.hoveredSub = k.address; else if (this.hoveredSub === k.address) this.hoveredSub = null; cx.notify(); })
       .on_click(() => (this.listed.has(k.address) ? run("pane.focus", { terminal: k.address }) : this.peek(k.address)))
       .children(s.lines.map(l => div().self_start().mt(-4).w(9).h(17).mr(4).flex_none()
         .when(Boolean(l), el => el.border_l(1.5).border_color(t.input))
         .when(l === "└" || l === "├", el => el.border_b(1.5).rounded_bl(6))))
       .when(Boolean(pic), el => el.child(div().mr(8).child(pic)))
       .child(div().flex_1().truncate().text_color(on ? t.foreground : t.muted).child(k.name || k.template || k.program?.name || k.address))
+      .when(this.hoveredSub === k.address && !this.listed.has(k.address), (el) => el.child(div().id(`beside-${k.address}`).flex_none().mr(6).px(5).rounded(4)
+        .text_size(11).text_color(t.muted).cursor_pointer().hover((s) => s.bg(t.raised).text_color(t.foreground)).tooltip("Open beside the focused pane (⌘⇧S)")
+        .on_click((_e, cx) => { cx.stop_propagation(); run("terminal.keep", { terminal: k.address, place: "right" }); })
+        .child("⇥ beside")))
       .child(this.status(t, { status: st }, compact));
   }
 
