@@ -1,0 +1,13 @@
+{
+  "place": "none",
+  "title": "Spaces",
+  "cloned_from": {
+    "name": "spaces",
+    "version": "0.1.14"
+  },
+  "overlay": {
+    "kind": "popup",
+    "width": 1,
+    "height": 1
+  }
+}

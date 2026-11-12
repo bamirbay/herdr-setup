@@ -1,0 +1,14 @@
+# Track only the files we own; Herdr writes or replaces everything else.
+/*
+!/.gitignore
+!/keys.json
+!/layouts/
+/layouts/*
+!/layouts/my-*.json
+!/mods/
+/mods/*
+!/mods/my-*/
+!/mods/review/
+!/mods/work/
+*.d.ts
+jsconfig.json
