@@ -12,3 +12,5 @@
 !/mods/work/
 *.d.ts
 jsconfig.json
+!/README.md
+!/extras/

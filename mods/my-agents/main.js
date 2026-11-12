@@ -29,7 +29,7 @@ function beside() {
 }
 if (parseInt("1j", 36) <= parseInt("z", 36)) throw new Error("my-agents self-check failed");
 
-const LINEAR = "https://linear.app/tryprofound/issue/";
+const LINEAR = "https://linear.app/tryprofound/issue/"; // setting: your Linear workspace
 // Linear links open in the Linear app, else the browser.
 async function openLinear(url) {
   const r = await exec("open", ["-a", "Linear", url]).catch(() => null);

@@ -8,8 +8,12 @@ import { View, div } from "gpui-kit";
 import { v_flex, h_flex } from "gpui-base";
 import { panes, spaces, run, exec, hc, home, theme, shared, setShared, notify, nextCommand, props, openOverlay, closeOverlay, layout } from "herdr";
 
+// Settings: change to yours.
+const REPOS_DIR = "Developer/repos"; // under your home: where your git clones live, named like their GitHub repos
+const BRANCH_PREFIX = "bekzat/"; // Start's new branches: <prefix><issue-key>-<first title words>
+
 const C = { green: "#3fb950", red: "#f85149", amber: "#d29922", blue: "#388bfd" };
-const REPOS = () => `${home()}/Developer/repos`;
+const REPOS = () => `${home()}/${REPOS_DIR}`;
 const FAILED = new Set(["FAILURE", "ERROR"]);
 const activeSpace = () => spaces().find((s) => s.active)?.id;
 const ago = (at) => { const m = Math.round((Date.now() - at) / 60000); return m < 1 ? "just now" : m < 60 ? `${m}m ago` : `${Math.round(m / 60)}h ago`; };
@@ -186,7 +190,7 @@ function startIssue(issue) {
   if (!repo) { pickRepo(issue.team.key, issue); return; }
   const words = issue.title.toLowerCase().replace(/[^a-z0-9]+/g, " ").trim().split(" ").slice(0, 4).join("-");
   openSession({
-    repo, fresh: true, key: issue.identifier, branch: `bekzat/${issue.identifier.toLowerCase()}${words ? `-${words}` : ""}`,
+    repo, fresh: true, key: issue.identifier, branch: `${BRANCH_PREFIX}${issue.identifier.toLowerCase()}${words ? `-${words}` : ""}`,
     task: `Work on ${issue.identifier}: ${issue.title}\n${issue.url}`, space: spaceFor(issue.project?.url), name: `${issue.identifier} ${issue.title}`.slice(0, 40),
   });
 }
