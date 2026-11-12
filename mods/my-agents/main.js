@@ -38,9 +38,9 @@ async function openLinear(url) {
 
 const MAIN_BRANCHES = new Set(["main", "master"]);
 const base = (path) => path.replace(/\/+$/, "").split("/").pop();
-// The Linear key a branch starts with, after the personal prefix: bekzat/aei-1835-fix -> AEI-1835.
-export const issueKey = (branch) => /^([a-z]+-\d+)(?:-|$)/i.exec((branch ?? "").replace(/^bekzat\//, ""))?.[1]?.toUpperCase() ?? null;
-if (!(issueKey("bekzat/aei-1835-fix-dedupe") === "AEI-1835" && issueKey("bekzat/fix-dedupe") === null && issueKey("main") === null && issueKey("AEI-12") === "AEI-12")) throw new Error("issueKey self-check failed");
+// The Linear key a branch starts with, after any "<name>/" prefix: bekzatamirbay/aei-1835-fix -> AEI-1835.
+export const issueKey = (branch) => /^([a-z]+-\d+)(?:-|$)/i.exec((branch ?? "").replace(/^[^/]+\//, ""))?.[1]?.toUpperCase() ?? null;
+if (!(issueKey("bekzat/aei-1835-fix-dedupe") === "AEI-1835" && issueKey("bekzatamirbay/aei-2371-x") === "AEI-2371" && issueKey("bekzat/fix-dedupe") === null && issueKey("main") === null && issueKey("AEI-12") === "AEI-12")) throw new Error("issueKey self-check failed");
 
 function find(node, id) {
   if (node?.id === id) return node;
@@ -115,7 +115,6 @@ export default class Agents extends View {
   init(_props, cx) {
     if (props()?.sortMenu) return;
     this.repos = {}; // [machine, folder] -> { value: {name, top, linked} | null (not a repo), at }
-    this.prs = {}; // [machine, repo top, branch] -> { value: {url, number, state} | null (none), at }
     this.inflight = new Set();
     this.folded = new Set();
     // Each agent's last state and when it changed (ms), kept across restarts.
@@ -247,38 +246,39 @@ export default class Agents extends View {
     }, cx);
   }
 
-  // No PR yet: asked again every 2 minutes, so a new one shows up. A PR: every 10, for merged/closed.
-  pr(on, top, branch, cx) {
-    return this.cached(this.prs, JSON.stringify(["pr", on, top, branch]), (v) => (v ? 600000 : 120000), async () => {
-      const r = await exec("gh", ["pr", "view", branch, "--json", "url,number,state"], { cwd: top, on });
-      if (r.code === 0) return JSON.parse(r.stdout);
-      if (/no pull requests found/i.test(r.stderr)) return null;
-      throw new Error(r.stderr);
-    }, cx);
+  // The branch's PR from the work badge's poll (your open PRs and last week's merged ones).
+  // shortcut: PRs you didn't open get no link; ask gh per branch if that matters.
+  pr(branch) {
+    const all = shared("work.prs");
+    return [...(all?.open ?? []), ...(all?.merged ?? [])].find((p) => p.branch === branch) ?? null;
   }
 
   // "repo · branch" in the main checkout, "repo ⎇ branch" in a worktree, "folder/" outside a repo,
-  // then links to the branch's Linear issue and PR.
+  // then links to the branch's Linear issue and PR (with CI ✓ ✗ • and the review decision).
   where(a, p, t, cx) {
     if (!p?.cwd) return null;
     const on = a.address.includes("/") ? a.address.split("/")[0] : null;
     const repo = this.repo(on, p.cwd, cx);
     const branch = p.branch;
-    const short = branch?.replace(/^bekzat\//, "");
+    const short = branch?.replace(/^[^/]+\//, "");
     const text = repo
       ? (short ? `${repo.name} ${repo.linked ? "⎇" : "·"} ${short}` : repo.name)
       : repo === null ? (p.cwd === home() ? "~" : `${base(p.cwd)}/`) : "";
     const issue = issueKey(branch);
-    const pr = repo && branch && !MAIN_BRANCHES.has(branch) ? this.pr(on, repo.top, branch, cx) : null;
-    const link = (id, label, url, tip, open = (u) => exec("open", [u])) => div().id(id).flex_none().px(4).rounded(4).text_color(t.muted)
+    const pr = branch && !MAIN_BRANCHES.has(branch) ? this.pr(branch) : null;
+    const link = (id, label, url, tip, open = (u) => exec("open", [u]), color = t.muted) => div().id(id).flex_none().px(4).rounded(4).text_color(color)
       .cursor_pointer().hover((s) => s.bg(t.hover).text_color(t.foreground)).tooltip(tip)
       .on_click((_e, cx) => { cx.stop_propagation(); open(url); })
       .child(label);
     if (!text && !issue && !pr) return null;
+    const failed = pr?.ci === "FAILURE" || pr?.ci === "ERROR", ci = !pr?.ci || pr.state !== "OPEN" ? "" : pr.ci === "SUCCESS" ? " ✓" : failed ? " ✗" : " •";
+    const prLabel = pr && (pr.state !== "OPEN" ? `#${pr.number} ${pr.state.toLowerCase()}`
+      : `#${pr.number}${ci}${pr.review === "APPROVED" ? " approved" : pr.review === "CHANGES_REQUESTED" ? " changes" : ""}`);
+    const prColor = pr && pr.state === "OPEN" ? (failed || pr.review === "CHANGES_REQUESTED" ? "#f85149" : pr.review === "APPROVED" ? "#3fb950" : t.muted) : t.muted;
     return h_flex().min_w(0).gap(4).items_center().text_size(11).text_color(t.dim)
       .child(div().flex_1().min_w(0).truncate().child(text))
       .when(Boolean(issue), (el) => el.child(link(`issue-${a.address}`, issue, LINEAR + issue, "Open Linear issue", openLinear)))
-      .when(Boolean(pr), (el) => el.child(link(`pr-${a.address}`, pr.state === "OPEN" ? `#${pr.number}` : `#${pr.number} ${pr.state.toLowerCase()}`, pr.url, "Open PR")));
+      .when(Boolean(pr), (el) => el.child(link(`pr-${a.address}`, prLabel, pr.url, "Open PR", undefined, prColor)));
   }
 
   // Live sub-agents of `addr`, depth first, each with the tree lines in front of it.
