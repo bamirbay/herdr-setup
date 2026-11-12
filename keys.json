@@ -71,7 +71,9 @@
   "mod:review": {
     "cmd-shift-c": "review.comment",
     "cmd-enter": "review.send",
-    "cmd-o": "review.open"
+    "cmd-o": "review.open",
+    "cmd-e": "review.viewed",
+    "cmd-shift-e": "review.only"
   },
   "terminal": {
     "cmd-f": "terminal.search",
