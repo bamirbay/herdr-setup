@@ -6,7 +6,7 @@
 // Shared: work.prs, work.issues, work.snap (last PR states, for alerts), work.repos (team key -> repo folder).
 import { View, div } from "gpui-kit";
 import { v_flex, h_flex } from "gpui-base";
-import { panes, spaces, run, exec, hc, home, theme, shared, setShared, notify, nextCommand, props, openOverlay, closeOverlay, layout } from "herdr";
+import { panes, spaces, focused, run, exec, hc, home, theme, shared, setShared, notify, nextCommand, props, openOverlay, closeOverlay, layout } from "herdr";
 
 // Settings: change to yours.
 const REPOS_DIR = "Developer/repos"; // under your home: where your git clones live, named like their GitHub repos
@@ -20,6 +20,9 @@ const ago = (at) => { const m = Math.round((Date.now() - at) / 60000); return m 
 
 // The Linear key a branch starts with, after any "<name>/" prefix: bekzatamirbay/aei-2371-x -> AEI-2371.
 export const issueKey = (branch) => /^([a-z]+-\d+)(?:-|$)/i.exec((branch ?? "").replace(/^[^/]+\//, ""))?.[1]?.toUpperCase() ?? null;
+// "owner/name" from a GitHub remote URL (ssh or https).
+export const ghRepo = (url) => /github\.com[:/]([^/]+\/[^/]+?)(?:\.git)?\/?$/.exec(url)?.[1] ?? null;
+if (ghRepo("git@github.com:org/repo.git") !== "org/repo" || ghRepo("https://github.com/org/repo") !== "org/repo" || ghRepo("/tmp/x") !== null) throw new Error("ghRepo self-check failed");
 
 // ---- GitHub
 
@@ -147,7 +150,12 @@ function sessionWhere(match) {
   return null;
 }
 function goTo(s) { run("space.select", { id: s.space.id }); run("tab.select", { id: s.tab.id }); run("pane.focus", { pane: s.pane.pane }); }
-const sessionName = (s) => (s.tab.named ? s.tab.name : s.pane.program?.name ?? s.pane.terminal);
+// The name the agents list shows: the tab's own name, else the program's live title (Claude's session title).
+const sessionName = (s) => {
+  const prog = s.pane.program?.name, live = (s.pane.title ?? "").replace(/^[^\p{L}\p{N}]+/u, "").trim();
+  const telling = live && live !== prog && !/^[~/]/.test(live) && !live.includes("@");
+  return (s.tab.name === prog || !s.tab.named) && telling ? live : s.tab.name || prog || s.pane.terminal;
+};
 
 // branch -> worktree folder (the main checkout included).
 async function worktrees(repo) {
@@ -373,18 +381,44 @@ export default class Work extends View {
         .when(Boolean(dir), (e) => e.child(this.chip(t, `clean-${p.url}`, "Clean up", null, () => cleanup(p, dir)))));
   }
 
+  // A folder's GitHub repo ("owner/name") from its origin remote; null outside a repo. Looked up once per folder.
+  repoOf(cwd, cx) {
+    this.remotes ??= new Map();
+    if (!this.remotes.has(cwd)) {
+      this.remotes.set(cwd, undefined);
+      cx.spawn(async (cx) => {
+        const r = await exec("git", ["-C", cwd, "remote", "get-url", "origin"]).catch(() => null);
+        this.remotes.set(cwd, r?.code === 0 ? ghRepo(r.stdout.trim()) : null);
+        cx.notify();
+      });
+    }
+    return this.remotes.get(cwd);
+  }
+
+  // The focused terminal's repo decides the list: in a repo or its worktree, that repo's PRs; elsewhere all of them.
+  // Its branch's PR (or "no PR yet") goes first, under "This pane".
   renderPRs(root, t, cx) {
     const data = shared("work.prs");
     this.loadTrees(data, cx);
+    const f = focused();
+    if (f?.cwd) this.focus = { cwd: f.cwd, branch: panes().find((p) => p.pane === f.pane)?.branch ?? null };
+    const repo = this.focus ? this.repoOf(this.focus.cwd, cx) : null, branch = this.focus?.branch;
+    const inRepo = (p) => !repo || p.owner.toLowerCase() === repo.toLowerCase();
+    const mine = branch && !/^(main|master)$/.test(branch) ? [...(data?.open ?? []), ...(data?.merged ?? [])].find((p) => p.branch === branch) ?? null : null;
     // Needing you first: CI failed, changes requested, comments not sent yet; then the most recently updated.
     const need = (p) => (FAILED.has(p.ci) ? 4 : 0) + (p.review === "CHANGES_REQUESTED" ? 2 : 0) + (unsent(p) > 0 ? 1 : 0);
-    const open = [...(data?.open ?? [])].sort((a, b) => need(b) - need(a) || (b.updated ?? "").localeCompare(a.updated ?? ""));
-    const merged = data?.merged ?? [];
+    const open = (data?.open ?? []).filter((p) => inRepo(p) && p !== mine).sort((a, b) => need(b) - need(a) || (b.updated ?? "").localeCompare(a.updated ?? ""));
+    const merged = (data?.merged ?? []).filter((p) => inRepo(p) && p !== mine);
+    const here = branch && !/^(main|master)$/.test(branch) && data ? [
+      this.section(t, `This pane · ${branch.replace(/^[^/]+\//, "")}`),
+      mine ? this.prRow(t, mine, mine.state !== "OPEN") : div().px(8).py(4).text_size(12).text_color(t.dim).child("No PR for this branch yet"),
+    ] : [];
     return root
-      .child(this.header(t, "Pull requests", data, () => refreshPRs(false), "prs"))
+      .child(this.header(t, repo ? `PRs · ${repo.split("/").pop()}` : "Pull requests", data, () => refreshPRs(false), "prs"))
       .when(Boolean(data?.error), (e) => e.child(div().px(12).py(6).text_size(11).text_color(C.red).child(data.error)))
       .child(this.list("work-prs", [
         ...(!data ? [div().p(8).text_color(t.dim).child("Loading…")] : []),
+        ...here,
         ...(data ? [this.section(t, `Open · ${open.length}`)] : []),
         ...open.map((p) => this.prRow(t, p, false)),
         ...(merged.length ? [this.section(t, `Merged · last 7 days · ${merged.length}`)] : []),
