@@ -1,12 +1,13 @@
 // Review, in three roles:
 // - the right sidebar: the changed files of the focused terminal's repo (a review tab's terminal while one is focused);
 //   clicking a file opens it in that terminal's review tab;
-// - a review tab, tied to one terminal (props.agent): one file's diff, with line comments sent to that agent;
-//   read-only while the terminal runs no agent;
+// - a review tab, tied to one terminal (props.agent): every changed file's diff in one list, with line comments
+//   sent to that agent; read-only while the terminal runs no agent;
 // - a launcher (mod.open, cmd-shift-g): opens or shows the focused terminal's review tab, then closes.
-// Shared state: review.mode, review.open (terminal -> file), review.comments (repo -> comments), review.tabs (terminal -> its tab's name).
+// Shared state: review.mode, review.open (terminal -> {path, at}: the file to jump to), review.comments (repo -> comments),
+// review.tabs (terminal -> its tab's name).
 import { View, div } from "gpui-kit";
-import { v_flex, h_flex, InputState, Input, Scrollbar, v_virtual_list } from "gpui-base";
+import { v_flex, h_flex, InputState, Input, Scrollbar, v_virtual_list, VirtualListScrollHandle } from "gpui-base";
 import { spaces, panes, focused, exec, hc, readTextFile, watchFolder, theme, settings, nextCommand, props, run, closeOverlay, notify, shared, setShared } from "herdr";
 
 // GitHub-dark style diff colors.
@@ -45,7 +46,7 @@ function setComments(ck, list) {
 function openTab(path) {
   const t = target();
   if (!t.terminal) { notify({ title: "Focus a terminal first", body: "A review tab belongs to the terminal it was opened from.", level: "warning" }); return; }
-  if (path) setShared("review.open", { ...(shared("review.open") ?? {}), [t.terminal]: path });
+  if (path) setShared("review.open", { ...(shared("review.open") ?? {}), [t.terminal]: { path, at: Date.now() } });
   const tabs = { ...tabsOf() }, space = spaces().find((s) => s.active);
   const existing = tabs[t.terminal] && space?.tabs.find((x) => x.name === tabs[t.terminal].name);
   if (existing) run("tab.select", { id: existing.id });
@@ -67,6 +68,24 @@ function openTab(path) {
 const READ = ["--no-optional-locks", "-c", "core.fsmonitor=false", "-c", "diff.autoRefreshIndex=false"];
 const countLines = (text) => text ? text.split("\n").length - Number(text.endsWith("\n")) : 0;
 const letter = (s) => (s[0] === "U" ? "U" : s[0] === "D" ? "D" : s[0] === "A" ? "A" : "M");
+const MAX_FILE = 5000, MAX_TOTAL = 50000, MAX_NEW = 200;
+// Folded until clicked: lockfiles, snapshots, minified files (and any diff over 1,000 lines).
+const BULKY = /(^|\/)(package-lock\.json|pnpm-lock\.yaml|[^/]*\.lock|[^/]*\.snap|[^/]*\.min\.(js|css))$/;
+
+// Splits `git diff --no-renames` output by file: "diff --git a/<p> b/<p>" has the same path twice.
+// shortcut: paths git still quotes (control characters, quotes) get no diff text; parse the quoting if that shows up.
+export function splitDiff(raw) {
+  const out = {};
+  let cur = null;
+  for (const line of raw.replace(/\n$/, "").split("\n")) {
+    if (line.startsWith("diff --git a/")) {
+      const rest = line.slice(11), n = (rest.length - 5) / 2;
+      cur = Number.isInteger(n) && rest.slice(n + 2, n + 5) === " b/" ? rest.slice(2, n + 2) : null;
+      if (cur !== null) out[cur] = [];
+    } else if (cur !== null) out[cur].push(line);
+  }
+  return out;
+}
 
 // Numbers each diff line once, so a frame only draws the rows on screen.
 function diffRows(lines) {
@@ -95,7 +114,9 @@ export function message(comments) {
 
 if (anchor("a.py", [{ kind: "+", number: 4 }, { kind: "+", number: 6 }]) !== "a.py:4-6"
   || anchor("a.py", [{ kind: "-", number: 9 }]) !== "a.py:9 (removed)"
-  || message([{ at: "a.py:4", quote: "x = 1", text: "why?" }]) !== "Review comments:\n- a.py:4 `x = 1` — why?") throw new Error("review self-check failed");
+  || message([{ at: "a.py:4", quote: "x = 1", text: "why?" }]) !== "Review comments:\n- a.py:4 `x = 1` — why?"
+  || JSON.stringify(splitDiff("diff --git a/x y b/x y\n--- a/x y\n+++ b/x y\n@@ -1 +1 @@\n-a\n+b\ndiff --git a/z b/z\n@@ -0,0 +1 @@\n+c\n"))
+    !== JSON.stringify({ "x y": ["--- a/x y", "+++ b/x y", "@@ -1 +1 @@", "-a", "+b"], z: ["@@ -0,0 +1 @@", "+c"] })) throw new Error("review self-check failed");
 
 export default class Review extends View {
   init(_props, cx) {
@@ -104,8 +125,8 @@ export default class Review extends View {
       cx.spawn(async () => { openTab(); closeOverlay(props().overlay); });
       return;
     }
-    this.files = []; this.rows = []; this.diffWidth = 0; this.message = ""; this.handle = cx.focus_handle();
-    this.commentsKey = null; this.sel = null; this.editing = null;
+    this.files = []; this.rows = []; this.auto = new Set(); this.fold = {}; this.message = ""; this.handle = cx.focus_handle();
+    this.commentsKey = null; this.sel = null; this.editing = null; this.scroll = VirtualListScrollHandle.new();
     this.input = InputState.new({ placeholder: "Commit message" });
     this.input.on("change", (_e, cx) => {
       const hadMessage = Boolean(this.message.trim());
@@ -153,8 +174,9 @@ export default class Review extends View {
     if (this.loading || this.busy) return;
     const { cwd, on } = target(), context = key();
     if (context !== this.context) {
-      this.context = context; this.root = null; this.files = []; this.open = null; this.sel = null; this.editing = null;
-      this.setLines([]); this.message = ""; this.input.set_value(""); this.error = null; this.note = null; this.done = null; this.watched = null; this.limited = false;
+      this.context = context; this.root = null; this.files = []; this.sel = null; this.editing = null;
+      this.rows = []; this.sig = null; this.fold = {}; this.cut = false; this.pr = null;
+      this.message = ""; this.input.set_value(""); this.error = null; this.note = null; this.done = null; this.watched = null; this.limited = false;
       this.commentsKey = null; this.baseNote = null;
     }
     if (!cwd) return;
@@ -163,7 +185,7 @@ export default class Review extends View {
       try {
         const top = await exec("git", ["rev-parse", "--show-toplevel"], { cwd, on });
         if (key() !== context) return;
-        if (top.code !== 0) { this.root = null; this.files = []; this.setLines([]); this.open = null; this.error = "Not a git repository"; return; }
+        if (top.code !== 0) { this.root = null; this.files = []; this.rows = []; this.sig = null; this.error = "Not a git repository"; return; }
         const root = top.stdout.trim(), git = (args) => exec("git", [...READ, ...args], { cwd: root, on });
         const status = await git(["status", "--porcelain=v1", "-z", "--no-renames", "--untracked-files=all"]);
         if (status.code !== 0) throw new Error(status.stderr);
@@ -214,54 +236,70 @@ export default class Review extends View {
         this.baseNote = mode() === "branch" && !base ? "No origin/main to compare with: showing uncommitted changes" : null;
         this.commentsKey = `comments:${JSON.stringify([on, root])}`;
         this.watch(root, cx);
-        if (!tied()) return; // The sidebar lists files; only a review tab loads a diff.
-        const want = (shared("review.open") ?? {})[tied()];
-        this.open = files.some((f) => f.path === want) ? want : files.some((f) => f.path === this.open) ? this.open : files[0]?.path ?? null;
-        if (this.open !== want && this.open) setShared("review.open", { ...(shared("review.open") ?? {}), [tied()]: this.open });
-        if (!this.open) { this.setLines([]); return; }
-        try { await this.load(this.open, context); }
-        catch { if (key() === context) this.setLines(["Cannot preview this diff (too large or unreadable)"]); }
+        if (!tied()) return; // The sidebar lists files; only a review tab loads diffs.
+        await this.loadAll(context);
+        this.loadPR(root, on, context, cx);
       } catch (e) { if (key() === context) this.error = String(e); }
       finally { this.loading = false; cx.notify(); }
     });
   }
 
-  async load(path, context) {
-    const file = this.files.find((f) => f.path === path), root = this.root, on = this.on;
-    if (!file) return;
-    let lines;
-    if (file.fresh || (!this.hasHead && file.status === "A")) {
-      const text = await readTextFile(`${root}/${path}`, { on }).catch(() => null);
-      if (text === null) lines = ["Cannot preview this file (binary, too large, or unreadable)"];
-      else if (text.includes("\0")) lines = ["Binary file · no text diff"];
-      else {
-        file.add = countLines(text);
-        lines = [`@@ -0,0 +1,${file.add} @@`, ...text.slice(0, 400000).replace(/\n$/, "").split("\n").slice(0, 1500).map(l => `+${l}`)];
-      }
-    } else {
-      const r = await exec("git", [...READ, "diff", ...(this.hasHead ? [this.target] : []), "--no-ext-diff", "--no-textconv", "--no-color", "--", path], { cwd: root, on });
+  // Every changed file's diff, in file-list order, each after a header row. Rebuilds only when the diff changed.
+  async loadAll(context) {
+    const root = this.root, on = this.on, files = this.files;
+    const direct = (f) => f.fresh || (!this.hasHead && f.status === "A");
+    let raw = "";
+    if (files.some((f) => !direct(f))) {
+      const r = await exec("git", [...READ, "-c", "core.quotePath=false", "diff", ...(this.hasHead ? [this.target] : []), "--no-ext-diff", "--no-textconv", "--no-color", "--no-renames"], { cwd: root, on });
       if (r.code !== 0) throw new Error(r.stderr);
-      const all = r.stdout.replace(/\n$/, "").split("\n"), first = all.findIndex((l) => l.startsWith("@@"));
-      lines = first < 0 ? [file.binary ? "Binary file changed" : "No text diff available"] : all.slice(first);
+      raw = r.stdout;
     }
-    if (key() === context && this.open === path) this.setLines(lines.slice(0, 1500).map(line => line.length > 4000 ? line.slice(0, 4000) + "… (line truncated)" : line));
+    const fresh = files.filter(direct).slice(0, MAX_NEW);
+    const texts = await Promise.all(fresh.map((f) => readTextFile(`${root}/${f.path}`, { on }).catch(() => null)));
+    const sig = [raw, ...texts, ...files.map((f) => f.path)].join("\u0001");
+    if (key() !== context || sig === this.sig) return;
+    const parsed = splitDiff(raw), text = new Map(fresh.map((f, n) => [f.path, texts[n]]));
+    const rows = [], auto = new Set();
+    let total = 0, cut = false;
+    for (const f of files) {
+      let lines;
+      if (direct(f)) {
+        const t = text.get(f.path);
+        if (t === undefined) lines = ["Not loaded: too many new files"];
+        else if (t === null) lines = ["Cannot preview this file (binary, too large, or unreadable)"];
+        else if (t.includes("\0")) lines = ["Binary file · no text diff"];
+        else { f.add = countLines(t); lines = [`@@ -0,0 +1,${f.add} @@`, ...t.slice(0, 400000).replace(/\n$/, "").split("\n").map((l) => `+${l}`)]; }
+      } else {
+        const all = parsed[f.path] ?? [], first = all.findIndex((l) => l.startsWith("@@"));
+        lines = first < 0 ? [f.binary ? "Binary file changed" : "No text diff available"] : all.slice(first);
+      }
+      if (lines.length > 1000 || BULKY.test(f.path)) auto.add(f.path);
+      if (lines.length > MAX_FILE) lines = [...lines.slice(0, MAX_FILE), `… cut at ${MAX_FILE.toLocaleString()} lines`];
+      if (total + lines.length > MAX_TOTAL) { lines = ["Not shown: this review is over 50,000 lines"]; cut = true; }
+      total += lines.length;
+      rows.push({ kind: "file", path: f.path, file: f, size: lines.length });
+      for (const r of diffRows(lines.map((l) => (l.length > 4000 ? l.slice(0, 4000) + "… (line truncated)" : l)))) { r.path = f.path; rows.push(r); }
+    }
+    this.sig = sig; this.rows = rows; this.auto = auto; this.cut = cut; this.sel = null;
   }
 
-  setLines(lines) {
-    this.rows = diffRows(lines);
-    this.diffWidth = Math.max(300, ...lines.map(line => line.length * 7 + 70));
-  }
-
-  // The review tab follows review.open, which the sidebar sets.
-  pick(path, cx) {
-    this.open = path; this.setLines([]); this.note = null; this.sel = null; this.editing = null;
-    const context = this.context;
+  // The branch's PR for the header; gh is asked again on a branch change or after 2 minutes.
+  loadPR(root, on, context, cx) {
+    if (this.prBusy) return;
+    this.prBusy = true;
     cx.spawn(async (cx) => {
-      try { await this.load(path, context); }
-      catch (e) { if (key() === context && this.open === path) this.note = `Cannot preview this diff (too large or unreadable): ${e}`; }
-      cx.notify();
+      try {
+        const branch = (await exec("git", [...READ, "branch", "--show-current"], { cwd: root, on })).stdout.trim();
+        if (!branch || /^(main|master)$/.test(branch)) { if (key() === context) this.pr = null; return; }
+        if (this.pr?.branch === branch && Date.now() - this.pr.at < 120000) return;
+        const r = await exec("gh", ["pr", "view", branch, "--json", "number,url,state"], { cwd: root, on }).catch(() => null);
+        if (key() === context) this.pr = { branch, at: Date.now(), data: r?.code === 0 ? JSON.parse(r.stdout) : null };
+      } catch { /* no PR link */ }
+      finally { this.prBusy = false; cx.notify(); }
     });
   }
+
+  folded(path) { return this.fold[path] ?? this.auto.has(path); }
 
   commit(cx) {
     if (!this.message.trim() || !this.root || this.busy || this.loading || this.context !== key()) return;
@@ -280,18 +318,19 @@ export default class Review extends View {
     cx.notify();
   }
 
-  // Click picks a line, shift-click extends the selection.
+  // Click picks a line, shift-click extends the selection within the same file.
   select(i, extend, cx) {
-    if (this.rows[i]?.number === undefined) return;
-    this.sel = extend && this.sel?.path === this.open ? { ...this.sel, b: i } : { path: this.open, a: i, b: i };
+    const row = this.rows[i];
+    if (row?.number === undefined) return;
+    this.sel = extend && this.sel && this.rows[this.sel.a]?.path === row.path ? { ...this.sel, b: i } : { a: i, b: i };
     this.handle.focus();
     cx.notify();
   }
 
   selectedRows() {
-    if (!this.sel || this.sel.path !== this.open) return [];
-    const lo = Math.min(this.sel.a, this.sel.b), hi = Math.max(this.sel.a, this.sel.b);
-    return this.rows.slice(lo, hi + 1).filter((r) => r.number !== undefined);
+    if (!this.sel) return [];
+    const lo = Math.min(this.sel.a, this.sel.b), hi = Math.max(this.sel.a, this.sel.b), path = this.rows[this.sel.a]?.path;
+    return this.rows.slice(lo, hi + 1).filter((r) => r.path === path && r.number !== undefined);
   }
 
   startComment(cx) {
@@ -299,7 +338,7 @@ export default class Review extends View {
     const rows = this.selectedRows();
     if (!rows.length) { this.note = "Select a line first: click it, shift-click for a range"; cx.notify(); return; }
     this.note = null; this.done = null;
-    this.editing = { index: -1, path: this.open, rows };
+    this.editing = { index: -1, path: rows[0].path, rows };
     this.commentInput.set_value("");
     this.commentInput.focus();
     cx.notify();
@@ -370,16 +409,28 @@ export default class Review extends View {
       .child(div().flex_1().min_w(0).truncate().child(text));
   }
 
+  fileRow({ path, file, size }, folded, t) {
+    const parts = path.split("/"), name = parts.pop();
+    return h_flex().w_full().h(20).flex_none().px(8).gap(8).items_center().bg(t.raised).border_t(1).border_color(t.border).cursor_pointer()
+      .child(div().w(10).flex_none().text_color(t.dim).child(folded ? "▸" : "▾"))
+      .child(div().w(10).flex_none().font_semibold().text_color(STATUS[file.status] ?? t.dim).child(file.status))
+      .child(h_flex().flex_1().min_w(0).child(div().text_color(t.dim).truncate().child(parts.length ? parts.join("/") + "/" : "")).child(div().font_semibold().flex_none().child(name)))
+      .when(folded, (e) => e.child(div().flex_none().text_size(11).text_color(t.dim).child(`${size.toLocaleString()} lines · click to show`)))
+      .when(file.add > 0, (e) => e.child(div().flex_none().text_size(11).text_color(C.green).child(`+${file.add}`)))
+      .when(file.del > 0, (e) => e.child(div().flex_none().text_size(11).text_color(C.red).child(`−${file.del}`)));
+  }
+
   commentRow(c, t) {
     return h_flex().w_full().h(20).flex_none().gap(6).pl(57).pr(8).items_center()
       .bg(C.comment).border_l(3).border_color(t.accent).text_color(t.foreground).font_family(settings().ui_font_family ?? "Geist")
       .child(div().flex_1().min_w(0).truncate().child(`› ${c.text}`));
   }
 
-  // Click a line to select it, shift-click to extend, double-click to comment; click a comment to edit it.
+  // Click a file header to fold it; a line to select it, shift-click to extend, double-click to comment; a comment to edit it.
   clickItem(key, cx) {
-    if (!this.canComment()) return;
     const index = Number(key.slice(1));
+    if (key[0] === "h") { const path = this.rows[index]?.path; if (path) { this.fold[path] = !this.folded(path); cx.notify(); } return; }
+    if (!this.canComment()) return;
     if (key[0] === "c") { this.editComment(index, cx); return; }
     const now = Date.now(), double = this.lastClick?.key === key && now - this.lastClick.at < 400;
     this.lastClick = { key, at: now };
@@ -387,16 +438,27 @@ export default class Review extends View {
     if (double) this.startComment(cx);
   }
 
-  // The open file's diff rows, each followed by the comments that end on it; comments whose line is gone go last.
+  // Header and rows per file (a folded file: its header only). A comment follows the line it ends on, else its
+  // file's end (line gone or folded); comments on files no longer changed go last.
   items() {
-    const here = this.comments().map((c, index) => ({ c, index })).filter(({ c }) => c.path === this.open);
-    const placed = new Set(), out = [];
-    const lo = this.sel?.path === this.open ? Math.min(this.sel.a, this.sel.b) : -1, hi = this.sel?.path === this.open ? Math.max(this.sel.a, this.sel.b) : -2;
+    const comments = this.comments(), at = new Map(), placed = new Set(), out = [];
+    const spot = (path, kind, number) => `${path}\0${kind}\0${number}`;
+    comments.forEach((c, index) => { const k = spot(c.path, c.end?.kind, c.end?.number); at.set(k, [...(at.get(k) ?? []), { c, index }]); });
+    const rest = (path) => comments.forEach((c, index) => { if (c.path === path && !placed.has(index)) { placed.add(index); out.push({ c, index }); } });
+    const lo = this.sel ? Math.min(this.sel.a, this.sel.b) : -1, hi = this.sel ? Math.max(this.sel.a, this.sel.b) : -2;
+    let path = null, folded = false;
     this.rows.forEach((row, i) => {
-      out.push({ row, i, selected: i >= lo && i <= hi });
-      for (const h of here) if (!placed.has(h.index) && h.c.end?.kind === row.kind && h.c.end?.number === row.number) { placed.add(h.index); out.push(h); }
+      if (row.kind === "file") {
+        if (path !== null) rest(path);
+        path = row.path; folded = this.folded(path);
+        out.push({ row, i, folded });
+      } else if (!folded) {
+        out.push({ row, i, selected: i >= lo && i <= hi });
+        for (const h of at.get(spot(row.path, row.kind, row.number)) ?? []) if (!placed.has(h.index)) { placed.add(h.index); out.push(h); }
+      }
     });
-    for (const h of here) if (!placed.has(h.index)) out.push(h);
+    if (path !== null) rest(path);
+    comments.forEach((c, index) => { if (!placed.has(index)) out.push({ c, index }); });
     return out;
   }
 
@@ -421,7 +483,7 @@ export default class Review extends View {
   renderList(root, t, button, notes) {
     const add = this.files.reduce((n, f) => n + f.add, 0), del = this.files.reduce((n, f) => n + f.del, 0);
     const enabled = Boolean(this.message.trim() && this.root && !this.busy && !this.loading);
-    const openPath = (shared("review.open") ?? {})[target().terminal];
+    const openPath = (shared("review.open") ?? {})[target().terminal]?.path;
     const perFile = {};
     for (const c of this.comments()) perFile[c.path] = (perFile[c.path] ?? 0) + 1;
     const modeButton = (id, label) => div().id(`mode-${id}`).px(6).py(1).rounded(4).text_size(10.5).cursor_pointer()
@@ -451,32 +513,45 @@ export default class Review extends View {
         .child(button("commit", this.busy === "commit" ? "Committing…" : "Commit", enabled, (_e, cx) => this.commit(cx))));
   }
 
-  // The review tab: one file's diff, comments and send.
+  // The review tab: every file's diff in one scroll, comments and send.
   renderTab(root, t, button, notes, cx) {
+    // A sidebar click sets review.open to {path, at}: unfold that file and scroll to its header, once per click.
     const want = (shared("review.open") ?? {})[tied()];
-    if (want && want !== this.open && this.files.some((f) => f.path === want)) this.pick(want, cx);
-    const can = this.canComment(), list = this.comments();
-    const file = this.files.find((f) => f.path === this.open);
-    const parts = (this.open ?? "").split("/"), name = parts.pop();
+    if (want?.at && want.at !== this.jumped && this.rows.some((r) => r.kind === "file" && r.path === want.path)) {
+      this.jumped = want.at; this.fold[want.path] = false; this.jump = want.path;
+    }
+    const can = this.canComment(), list = this.comments(), pr = this.pr?.data;
+    const add = this.files.reduce((n, f) => n + f.add, 0), del = this.files.reduce((n, f) => n + f.del, 0);
     const editingAt = this.editing ? (this.editing.index >= 0 ? list[this.editing.index]?.at : anchor(this.editing.path, this.editing.rows)) : null;
     // The virtual list keeps its first callbacks, so they read this.diffItems (live), never a render-local list.
     this.diffItems = this.items();
+    // "top" only scrolls to the nearest edge: go to the bottom first, so the header then lands at the top.
+    if (this.jump) {
+      const i = this.diffItems.findIndex((it) => it.row?.kind === "file" && it.row.path === this.jump);
+      this.jump = null;
+      if (i >= 0) { this.scroll.scroll_to_bottom(); cx.timer.after(32, () => this.scroll.scroll_to_item(i, "top")); }
+    }
+    const itemKey = (i) => { const it = this.diffItems[i]; return !it ? `x${i}` : !it.row ? `c${it.index}` : `${it.row.kind === "file" ? "h" : "r"}${it.i}`; };
+    const itemRow = (it) => (!it.row ? this.commentRow(it.c, theme()) : it.row.kind === "file" ? this.fileRow(it.row, it.folded, theme()) : this.diffRow(it.row, it.selected, theme()));
     return notes(root
       .on_modifiers_changed((e) => { this.shift = e.modifiers.shift; })
       .child(h_flex().h(42).flex_none().px(14).gap(8).items_center().border_b(1).border_color(t.border)
-        .child(h_flex().flex_1().min_w(0).child(div().text_color(t.dim).truncate().child(parts.length ? parts.join("/") + "/" : "")).child(div().font_semibold().flex_none().child(name || "No file")))
-        .when(Boolean(file?.add), (e) => e.child(div().text_size(11).text_color(C.green).child(`+${file.add}`)))
-        .when(Boolean(file?.del), (e) => e.child(div().text_size(11).text_color(C.red).child(`−${file.del}`)))
+        .child(div().font_semibold().flex_none().child(`${this.files.length} file${this.files.length === 1 ? "" : "s"}`))
+        .when(add > 0, (e) => e.child(div().text_size(11).text_color(C.green).child(`+${add}`)))
+        .when(del > 0, (e) => e.child(div().text_size(11).text_color(C.red).child(`−${del}`)))
         .child(div().text_size(10.5).text_color(t.dim).child(mode() === "branch" ? "vs origin/main" : "uncommitted"))
+        .when(Boolean(pr), (e) => e.child(div().id("pr").px(6).py(1).rounded(4).border_1().border_color(t.border).text_size(11).cursor_pointer().hover((s) => s.bg(t.hover))
+          .on_click(() => { exec("open", [pr.url]).catch(() => null); }).child(`PR #${pr.number}${pr.state === "OPEN" ? "" : ` · ${pr.state.toLowerCase()}`}`)))
+        .child(div().flex_1())
         .when(!can, (e) => e.child(div().px(6).py(1).rounded(4).border_1().border_color(t.border).text_size(10.5).text_color(t.dim).child("read-only · not an agent")))
         .when(can && list.length > 0, (e) => e.child(div().id("send").h(26).px(10).flex().items_center().rounded(6).bg(this.busy ? t.raised : t.solid).text_color(this.busy ? t.dim : t.solid_foreground).text_size(12).cursor_pointer()
           .on_click((_e, cx) => this.send(cx)).child(this.busy === "send" ? "Sending…" : `Send ${list.length} ⌘↵`))))
       .when(Boolean(this.baseNote), (e) => e.child(div().px(12).py(4).text_size(11).text_color(t.dim).child(this.baseNote)))
+      .when(this.cut, (e) => e.child(div().px(12).py(4).text_size(11).text_color(t.dim).child("Over 50,000 diff lines: later files show their header only")))
+      // No sideways scroll around the list: it took the wheel. Long lines are cut with "…".
       .child(div().flex_1().min_h(0).min_w(0).relative().font_family(settings().font_family ?? "JetBrains Mono").text_size(12)
-        .child(div().id("changes-diff-x").size_full().overflow_x_scrollbar()
-          .child(div().w_full().min_w(this.diffWidth).h_full().child(v_virtual_list("changes-diff", this.diffItems.length, 20, (i) => (this.diffItems[i]?.row ? `r${this.diffItems[i].i}` : `c${this.diffItems[i]?.index ?? i}`),
-            (range) => this.diffItems.slice(range.start, range.end).map((it) => (it.row ? this.diffRow(it.row, it.selected, theme()) : this.commentRow(it.c, theme())))).size_full()
-            .on_item_click((key, cx) => this.clickItem(key, cx)))))
+        .child(v_virtual_list("changes-diff", this.diffItems.length, 20, itemKey, (range) => this.diffItems.slice(range.start, range.end).map(itemRow))
+          .track_scroll(this.scroll).size_full().on_item_click((key, cx) => this.clickItem(key, cx)))
         .child(Scrollbar.vertical("changes-diff").viewport_from_layout().absolute().inset_0())
         .when(!this.files.length, (e) => e.child(div().absolute().top(6).px(12).text_color(t.dim).child(this.error || (this.loading ? "Loading changes…" : "No changes")))))
       .when(Boolean(this.editing), (e) => e.child(v_flex().flex_none().p(10).gap(6).border_t(1).border_color(t.border)
