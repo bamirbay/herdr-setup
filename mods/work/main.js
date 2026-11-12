@@ -33,7 +33,7 @@ fragment pr on PullRequest {
   repository { name nameWithOwner }
   reviewDecision
   commits(last: 1) { nodes { commit { statusCheckRollup { state } } } }
-  reviewThreads(first: 100) { nodes { isResolved } }
+  reviewThreads(first: 100) { nodes { id isResolved } }
 }`;
 
 async function fetchPRs() {
@@ -44,7 +44,8 @@ async function fetchPRs() {
   const pr = (n) => ({
     number: n.number, title: n.title, url: n.url, draft: n.isDraft, state: n.state, branch: n.headRefName, head: n.headRefOid,
     repo: n.repository.name, owner: n.repository.nameWithOwner, review: n.reviewDecision, updated: n.updatedAt, merged: n.mergedAt,
-    ci: n.commits?.nodes?.[0]?.commit?.statusCheckRollup?.state ?? null, unresolved: n.reviewThreads.nodes.filter((t) => !t.isResolved).length,
+    ci: n.commits?.nodes?.[0]?.commit?.statusCheckRollup?.state ?? null,
+    threads: n.reviewThreads.nodes.filter((t) => !t.isResolved).map((t) => t.id), unresolved: n.reviewThreads.nodes.filter((t) => !t.isResolved).length,
   });
   return { at: Date.now(), open: d.open.nodes.filter((n) => n.number).map(pr), merged: d.merged.nodes.filter((n) => n.number).map(pr) };
 }
@@ -81,13 +82,23 @@ async function refreshPRs(withAlerts) {
       setShared("work.snap", snapshot(d));
     }
     setShared("work.prs", d);
+    // Sent threads of PRs no longer open are forgotten.
+    const sent = shared("work.sent") ?? {}, keep = Object.fromEntries(d.open.filter((p) => sent[p.url]).map((p) => [p.url, sent[p.url]]));
+    if (Object.keys(keep).length !== Object.keys(sent).length) setShared("work.sent", keep);
   } catch (e) {
     setShared("work.prs", { open: [], merged: [], ...(shared("work.prs") ?? {}), error: String(e.message ?? e).slice(0, 300) });
   }
 }
 
+// Unresolved review threads not yet sent to the PR's session (work.sent: PR url -> thread ids sent).
+const unsent = (p) => {
+  if (!p.threads) return p.unresolved; // stored before thread ids were
+  const sent = new Set((shared("work.sent") ?? {})[p.url] ?? []);
+  return p.threads.filter((id) => !sent.has(id)).length;
+};
+
 const THREADS_QUERY = `query($o: String!, $n: String!, $num: Int!) { repository(owner: $o, name: $n) { pullRequest(number: $num) {
-  reviewThreads(first: 100) { nodes { isResolved path line originalLine comments(first: 20) { nodes { author { login } body } } } } } } }`;
+  reviewThreads(first: 100) { nodes { id isResolved path line originalLine comments(first: 20) { nodes { author { login } body } } } } } } }`;
 
 export function threadsMessage(p, threads) {
   const lines = threads.filter((t) => !t.isResolved).map((t) => {
@@ -206,10 +217,14 @@ async function sendComments(p, s) {
     const [o, n] = p.owner.split("/");
     const r = await exec("gh", ["api", "graphql", "-f", `query=${THREADS_QUERY}`, "-f", `o=${o}`, "-f", `n=${n}`, "-F", `num=${p.number}`]);
     if (r.code !== 0) throw new Error((r.stderr || r.stdout).trim());
-    const threads = JSON.parse(r.stdout).data.repository.pullRequest.reviewThreads.nodes;
+    const open = JSON.parse(r.stdout).data.repository.pullRequest.reviewThreads.nodes.filter((t) => !t.isResolved);
+    const before = new Set((shared("work.sent") ?? {})[p.url] ?? []), fresh = open.filter((t) => !before.has(t.id));
+    if (!fresh.length) { notify({ title: `#${p.number}: nothing new to send`, body: `All ${open.length} unresolved comments were already sent.`, level: "info" }); return; }
     // A blocked agent refuses it (hc send without --force).
-    const sent = await hc(["send", s.pane.terminal, threadsMessage(p, threads)]);
+    const sent = await hc(["send", s.pane.terminal, threadsMessage(p, fresh)]);
     if (sent.code !== 0) throw new Error((sent.stderr || sent.stdout).trim());
+    setShared("work.sent", { ...(shared("work.sent") ?? {}), [p.url]: open.map((t) => t.id) });
+    notify({ title: `Sent ${fresh.length} comment${fresh.length === 1 ? "" : "s"} from #${p.number}`, body: `To ${sessionName(s)}`, level: "info" });
     goTo(s);
   } catch (e) {
     notify({ title: `Couldn't send #${p.number}'s comments`, body: String(e.message ?? e).slice(0, 300), level: "error" });
@@ -348,9 +363,11 @@ export default class Work extends View {
         .child(div().flex_1().min_w(0).truncate().child(`${p.repo} · ${p.branch.replace(/^[^/]+\//, "")}`))
         .when(p.draft, (e) => e.child(this.chip(t, `draft-${p.url}`, "draft")))
         .when(Boolean(review) && !merged, (e) => e.child(this.chip(t, `rv-${p.url}`, review[0], review[1])))
-        .when(p.unresolved > 0 && !merged, (e) => e.child(s
-          ? this.chip(t, `send-${p.url}`, `Send ${p.unresolved} comment${p.unresolved === 1 ? "" : "s"}`, C.amber, () => sendComments(p, s))
-          : this.chip(t, `un-${p.url}`, `${p.unresolved} unresolved`, C.amber)))
+        .when(p.unresolved > 0 && !merged, (e) => e.child(!s
+          ? this.chip(t, `un-${p.url}`, `${p.unresolved} unresolved`, C.amber)
+          : unsent(p) > 0
+            ? this.chip(t, `send-${p.url}`, `Send ${unsent(p)} new comment${unsent(p) === 1 ? "" : "s"}`, C.amber, () => sendComments(p, s))
+            : this.chip(t, `sent-${p.url}`, `✓ ${p.unresolved} sent`, C.green)))
         .when(Boolean(s), (e) => e.child(this.chip(t, `go-${p.url}`, `→ ${sessionName(s)}`.slice(0, 28), t.foreground, () => goTo(s))))
         .when(!s && !merged, (e) => e.child(this.chip(t, `open-${p.url}`, "Open", null, () => openPR(p))))
         .when(Boolean(dir), (e) => e.child(this.chip(t, `clean-${p.url}`, "Clean up", null, () => cleanup(p, dir)))));
@@ -359,8 +376,8 @@ export default class Work extends View {
   renderPRs(root, t, cx) {
     const data = shared("work.prs");
     this.loadTrees(data, cx);
-    // Needing you first: CI failed, changes requested, unresolved comments; then the most recently updated.
-    const need = (p) => (FAILED.has(p.ci) ? 4 : 0) + (p.review === "CHANGES_REQUESTED" ? 2 : 0) + (p.unresolved > 0 ? 1 : 0);
+    // Needing you first: CI failed, changes requested, comments not sent yet; then the most recently updated.
+    const need = (p) => (FAILED.has(p.ci) ? 4 : 0) + (p.review === "CHANGES_REQUESTED" ? 2 : 0) + (unsent(p) > 0 ? 1 : 0);
     const open = [...(data?.open ?? [])].sort((a, b) => need(b) - need(a) || (b.updated ?? "").localeCompare(a.updated ?? ""));
     const merged = data?.merged ?? [];
     return root
@@ -442,14 +459,14 @@ export default class Work extends View {
   renderBadge(t) {
     const prs = shared("work.prs"), iss = shared("work.issues"), open = prs?.open ?? [];
     const failing = open.filter((p) => FAILED.has(p.ci)).length, changes = open.filter((p) => p.review === "CHANGES_REQUESTED").length;
-    const comments = open.filter((p) => p.unresolved > 0).length;
+    const comments = open.filter((p) => unsent(p) > 0).length;
     const part = (id, onClick) => h_flex().id(id).gap(6).items_center().cursor_pointer().hover((s) => s.text_color(t.foreground)).on_click(onClick);
     return h_flex().size_full().px(10).gap(14).items_center().justify_end().text_size(11).text_color(t.dim)
       .child(part("badge-prs", () => togglePane("prs")).tooltip("Pull requests (⌘⇧I)")
         .child(div().child(prs ? `${open.length} PRs` : "PRs …"))
         .when(failing > 0, (e) => e.child(div().text_color(C.red).child(`✗ ${failing}`)))
         .when(changes > 0, (e) => e.child(div().text_color(C.red).child(`${changes} changes`)))
-        .when(comments > 0, (e) => e.child(div().text_color(C.amber).child(`${comments} with comments`)))
+        .when(comments > 0, (e) => e.child(div().text_color(C.amber).child(`${comments} with new comments`)))
         .when(Boolean(prs?.error), (e) => e.child(div().text_color(C.red).child("!"))))
       .child(part("badge-linear", () => togglePane("linear")).tooltip("Linear (⌘⇧L)")
         .child(div().child(iss?.nokey ? "Linear: add a key" : iss ? `${visibleIssues(iss).issues.length} issues` : "Linear …"))
