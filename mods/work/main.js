@@ -175,6 +175,12 @@ function spaceFor(projectUrl) {
   return hit ? hit[0] : activeSpace();
 }
 
+// In a space linked to a Linear project (cmd-l's link), only that project's issues; elsewhere all of yours.
+function visibleIssues(data) {
+  const want = slug((shared("linear.projects") ?? {})[activeSpace()]), all = data?.issues ?? [];
+  return { want, issues: want ? all.filter((i) => slug(i.project?.url) === want) : all };
+}
+
 function startIssue(issue) {
   const repo = (shared("work.repos") ?? {})[issue.team.key];
   if (!repo) { pickRepo(issue.team.key, issue); return; }
@@ -382,23 +388,25 @@ export default class Work extends View {
   }
 
   renderLinear(root, t) {
-    const data = shared("work.issues"), repos = shared("work.repos") ?? {};
+    const data = shared("work.issues"), repos = shared("work.repos") ?? {}, { want, issues } = visibleIssues(data);
     const groups = new Map();
-    for (const i of data?.issues ?? []) {
+    for (const i of issues) {
       const k = i.project?.name ?? "No project";
       groups.set(k, [...(groups.get(k) ?? []), i]);
     }
     const ordered = [...groups.entries()].sort(([a], [b]) => (a === "No project") - (b === "No project") || a.localeCompare(b));
-    const teams = [...new Set((data?.issues ?? []).map((i) => i.team.key))].sort();
+    const teams = [...new Set(issues.map((i) => i.team.key))].sort();
+    const title = want ? `Linear · ${issues[0]?.project?.name ?? spaces().find((s) => s.active)?.name ?? "this project"}` : "Linear";
     const noKey = v_flex().p(10).gap(8).text_size(12).text_color(t.muted)
       .child(div().child("Add a Linear API key: in Linear, Settings → Security & access → Personal API keys → New key. Then run this in a terminal and paste the key:"))
       .child(div().p(8).rounded(6).bg(t.raised).font_family("JetBrains Mono").text_size(11).text_color(t.foreground).child("security add-generic-password -s herdr-linear -a linear -w"))
       .child(div().child("Then press Refresh."));
     return root
-      .child(this.header(t, "Linear", data, () => refreshIssues(), "linear"))
+      .child(this.header(t, title, data, () => refreshIssues(), "linear"))
       .when(Boolean(data?.error), (e) => e.child(div().px(12).py(6).text_size(11).text_color(C.red).child(data.error)))
       .child(data?.nokey ? noKey : this.list("work-linear", [
         ...(!data ? [div().p(8).text_color(t.dim).child("Loading…")] : []),
+        ...(data && !data.nokey && !issues.length ? [div().p(8).text_color(t.dim).child(want ? "None of your open issues are in this project." : "No open issues assigned to you.")] : []),
         ...ordered.flatMap(([name, list]) => [this.section(t, `${name} · ${list.length}`), ...[...list].sort((a, b) => (b.state.type === "started") - (a.state.type === "started")).map((i) => this.issueRow(t, i))]),
       ]))
       .when(teams.length > 0, (e) => e.child(v_flex().flex_none().px(14).py(8).gap(3).border_t(1).border_color(t.border).text_size(11).text_color(t.dim)
@@ -440,7 +448,7 @@ export default class Work extends View {
         .when(comments > 0, (e) => e.child(div().text_color(C.amber).child(`${comments} with comments`)))
         .when(Boolean(prs?.error), (e) => e.child(div().text_color(C.red).child("!"))))
       .child(part("badge-linear", () => togglePane("linear")).tooltip("Linear (⌘⇧L)")
-        .child(div().child(iss?.nokey ? "Linear: add a key" : iss ? `${iss.issues.length} issues` : "Linear …"))
+        .child(div().child(iss?.nokey ? "Linear: add a key" : iss ? `${visibleIssues(iss).issues.length} issues` : "Linear …"))
         .when(Boolean(iss?.error), (e) => e.child(div().text_color(C.red).child("!"))));
   }
 }
