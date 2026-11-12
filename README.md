@@ -15,17 +15,19 @@ A Herdr window for working with coding agents:
 | `mods/my-agents` | Agents list. Each row shows its repo, branch, Linear issue and PR (with CI and review state). Sub-agents can open beside the focused pane |
 | `mods/review` | The right sidebar lists changed files. The review tab shows every file's diff in one scroll, with line comments sent to the agent |
 | `mods/work` | The PR pane, the Linear pane and the status bar badge. The badge polls GitHub and Linear and posts PR alerts |
+| `mods/my-tabs` | The tab bar, with **PRs** (a red dot when a PR needs you), **Linear** and **Changes** buttons on the right |
+| `mods/my-pane` | Each pane's header. On the right it shows the branch's Linear issue and PR. Its close button follows the `cmd-w` rules |
 | `keys.json` | Key bindings (see below) |
 | `extras/` | Pieces that live outside Herdr's folder (see Install) |
 
 ## Install
 
-1. Copy `layouts/my-main.json` and the four `mods/` folders into `~/.config/herdr-app/`.
+1. Copy `layouts/my-main.json` and the six `mods/` folders into `~/.config/herdr-app/`.
    Merge `keys.json` into yours: add its keys and sections, and don't overwrite keys you already use.
    Then run `herdr-app do layout.switch --name my-main`.
 2. Change the settings to yours:
    - `mods/work/main.js` top: `REPOS_DIR` and `BRANCH_PREFIX`.
-   - `mods/my-agents/main.js`: `LINEAR`, the Linear workspace URL.
+   - `mods/my-agents/main.js` and `mods/my-pane/main.js`: `LINEAR`, the Linear workspace URL.
 3. Linear: create a personal API key (Linear → Settings → Security & access).
    Run `security add-generic-password -s herdr-linear -a linear -w` and paste the key.
    The key stays in Keychain.
