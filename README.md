@@ -35,9 +35,10 @@ A Herdr window for working with coding agents:
    - `extras/herdr-core-templates/*.md` → `~/.config/herdr-core/templates/`.
      These are the two PR reviewers. They need the `ponytail-review` and `thermo-nuclear-code-quality-review` Claude skills.
    - `extras/CLAUDE.md` → append to `~/.claude/CLAUDE.md`. It tells agents how to use sub-agents and the reviewers.
-   - If your tools come from mise, add `eval "$(mise activate zsh --shims)"` to `~/.zprofile`.
-     Without it, Claude hooks fail with `node: command not found` in agents started by `hc`.
-     It takes effect after `hc server stop && hc server start`, which ends running agents.
+   - If Claude hooks fail with `node: command not found` in agents started by `hc`: those programs get your login
+     session's PATH (it has `~/.local/bin` and Homebrew) and don't read shell profiles, so node from nvm or mise is
+     missing. Link it there, as Herdr does with `hc`: `ln -s "$(command -v node)" ~/.local/bin/node`.
+     No restart needed. Re-link after you switch node versions.
 
 Or tell your Claude: "add the Herdr setup from this repo".
 
