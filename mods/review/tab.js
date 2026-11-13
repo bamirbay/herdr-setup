@@ -65,7 +65,7 @@ export class ReviewTab extends RepoView {
     if (this.only) { this.only = path; this.jump = path; } else this.fold[path] = !this.folded(path);
   }
 
-  // cmd-e: mark the top file viewed (folds it, jumps to the next file), or unmark it.
+  // cmd-e: mark the top file viewed (it folds in place, its header stays at the top and the next file follows), or unmark it.
   toggleViewed(cx) {
     const path = this.currentPath(), h = path && this.headers?.get(path);
     if (!h) return;
@@ -74,8 +74,7 @@ export class ReviewTab extends RepoView {
     delete this.fold[path];
     this.only = null;
     setViewed(this.commentsKey, map);
-    const order = [...this.headers.keys()];
-    this.jump = was ? path : order[order.indexOf(path) + 1] ?? path;
+    this.jump = path;
     cx.notify();
   }
 
