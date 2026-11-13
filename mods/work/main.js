@@ -462,7 +462,8 @@ export default class Work extends View {
     const failing = open.filter((p) => FAILED.has(p.ci)).length, changes = open.filter((p) => p.review === "CHANGES_REQUESTED").length;
     const comments = open.filter((p) => unsent(p) > 0).length;
     const part = (id, onClick) => h_flex().id(id).gap(6).items_center().cursor_pointer().hover((s) => s.text_color(t.foreground)).on_click(onClick);
-    return h_flex().size_full().px(10).gap(14).items_center().justify_end().text_size(11).text_color(t.dim)
+    // The status bar's own look (workspace-status: chrome background, top border), so the two read as one bar.
+    return h_flex().size_full().px(14).gap(14).items_center().justify_end().bg(t.chrome).border_t(1).border_color(t.border).text_size(11.8).text_color(t.muted)
       .child(part("badge-prs", () => run("my-tabs.prs")).tooltip("Pull requests (⌘⇧I)")
         .child(div().child(prs ? `${open.length} PRs` : "PRs …"))
         .when(failing > 0, (e) => e.child(div().text_color(C.red).child(`✗ ${failing}`)))
