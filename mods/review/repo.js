@@ -23,10 +23,11 @@ export class RepoView {
   paused() { return false; }
 
   tick(cx) { if (onScreen() && !this.paused()) this.refresh(cx); else this.stale = true; }
-  catchUp(cx) { if (key() !== this.context || (this.stale && onScreen() && !this.paused())) { this.stale = false; this.refresh(cx); } }
+  // Nothing starts over while paused: a context change would close a half-written comment.
+  catchUp(cx) { if (!this.paused() && (key() !== this.context || (this.stale && onScreen()))) { this.stale = false; this.refresh(cx); } }
 
   refresh(cx) {
-    if (this.loading || this.busy) return;
+    if (this.loading || this.busy) { this.stale = true; return; } // caught up after the current load
     const t = target(), context = key();
     if (context !== this.context) {
       // Another repo or mode: drop what belongs to the old one, but keep its files on screen (dimmed) until the new ones load.
@@ -59,14 +60,16 @@ export class RepoView {
   watch(root, cx) {
     if (this.on || this.watched === root) return;
     this.watched = root;
+    // One loop at a time: a new watch (another repo, or a mode switch on the same one) ends the old loop.
+    const gen = (this.watchGen = (this.watchGen ?? 0) + 1), live = () => this.watchGen === gen;
     cx.spawn(async (cx) => {
       try {
-        while (this.watched === root) {
+        while (live()) {
           await watchFolder(root);
           await cx.sleep(BURST_MS); // an agent's burst of writes becomes one refresh
-          if (this.watched === root) this.tick(cx);
+          if (live()) this.tick(cx);
         }
-      } catch { this.watched = null; }
+      } catch { if (live()) this.watched = null; }
     });
   }
 

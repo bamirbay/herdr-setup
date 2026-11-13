@@ -6,7 +6,7 @@
 import { div } from "gpui-kit";
 import { h_flex, v_flex, TextareaState, Textarea } from "gpui-base";
 import { panes, exec, hc, run, settings, shared, theme } from "herdr";
-import { mode, tied, target, key, prFor, viewedOf, setViewed, setComments, onScreen } from "./state.js";
+import { mode, tied, target, key, prFor, viewedOf, setViewed, commentsOf, setComments, onScreen } from "./state.js";
 import { C, STATUS, anchor, message, loadDiffs } from "./git.js";
 import { RepoView } from "./repo.js";
 
@@ -54,14 +54,15 @@ export class ReviewTab extends RepoView {
     this.areaH = 0; this.areaW = 0;
     this.composer = TextareaState.new({ placeholder: "Comment · ⌘↵ saves · Esc cancels" });
     this.composer.set_auto_grow(1, 6);
-    this.composer.on("submit", (_e, cx) => this.saveComment(cx));
+    // ⌘↵ saves; a plain Enter stays a new line in the comment.
+    this.composer.on("submit", (e, cx) => { if (e?.secondary) this.saveComment(cx); });
   }
 
+  // A context switch keeps the old rows on screen (dimmed) until the new diff replaces them; per-view choices go.
   reset() {
-    Object.assign(this, {
-      rows: [], auto: new Set(), fold: {}, only: null, sel: null, editing: null, preview: null, help: false, sig: null, cut: false,
-      headers: new Map(), memo: null, items: [], sizes: [], offsets: [0], fileOf: [], keyIndex: new Map(), top: 0, jump: null, reveal: null,
-    });
+    this.rows ??= []; this.headers ??= new Map(); this.auto ??= new Set(); this.items ??= []; this.sizes ??= []; this.offsets ??= [0];
+    this.fileOf ??= []; this.keyIndex ??= new Map(); this.top ??= 0;
+    Object.assign(this, { fold: {}, only: null, sel: null, editing: null, preview: null, help: false, sig: null, memo: null, jump: null, reveal: null });
   }
 
   // No refresh while a comment or the send preview is open (it would move what you're writing about).
@@ -81,8 +82,11 @@ export class ReviewTab extends RepoView {
     }
   }
 
+  // The keyboard goes back to the comment box while one is open, else to the tab.
+  focusSelf() { (this.editing ? this.composer : this.handle).focus(); }
+
   command(name, cx) {
-    super.command(name);
+    if (name === "focus") this.focusSelf();
     if (name === "comment") this.startComment(cx);
     if (name === "send") this.requestSend(cx);
     if (name === "viewed") this.toggleViewed(cx);
@@ -108,9 +112,8 @@ export class ReviewTab extends RepoView {
     const comments = this.comments(), at = new Map(), placed = new Set(), out = [];
     const spot = (path, kind, number) => `${path}\0${kind}\0${number}`;
     comments.forEach((c, index) => { if (c.end) { const k = spot(c.path, c.end.kind, c.end.number); at.set(k, [...(at.get(k) ?? []), index]); } });
-    const comment = (index) => { placed.add(index); out.push({ type: "comment", key: `c\0${index}\0${comments[index].text}`, c: comments[index], index, path: comments[index].path }); };
+    const comment = (index) => { placed.add(index); out.push({ type: "comment", key: `c\0${index}`, c: comments[index], index, path: comments[index].path }); };
     const rest = (path) => comments.forEach((c, index) => { if (c.path === path && !placed.has(index)) comment(index); });
-    const lo = this.sel ? Math.min(this.sel.a, this.sel.b) : -1, hi = this.sel ? Math.max(this.sel.a, this.sel.b) : -2;
     let path = null, folded = false;
     this.rows.forEach((row, i) => {
       if (row.kind === "file") {
@@ -119,7 +122,7 @@ export class ReviewTab extends RepoView {
         out.push({ type: "file", key: rowKey(row), row, i, folded, path });
         comments.forEach((c, index) => { if (c.path === path && !c.end && !placed.has(index)) comment(index); });
       } else if (!folded) {
-        out.push({ type: "row", key: rowKey(row), row, i, selected: i >= lo && i <= hi, path });
+        out.push({ type: "row", key: rowKey(row), row, i, path });
         for (const index of at.get(spot(row.path, row.kind, row.number)) ?? []) if (!placed.has(index)) comment(index);
       }
     });
@@ -134,7 +137,8 @@ export class ReviewTab extends RepoView {
 
   // Rebuilds items when something they show changed, keeping the row at the top of the view where it was.
   layout(list, viewedMap) {
-    const memo = JSON.stringify([this.rowsVer, this.fold, this.only, this.sel, list, viewedMap, Math.round(this.areaW / 20)]);
+    // The selection isn't in here (rows read it when drawn); the wrap width is, as comment heights depend on it.
+    const memo = JSON.stringify([this.rowsVer, this.fold, this.only, list, viewedMap, this.commentWidth()]);
     if (memo === this.memo) return;
     const keep = this.items.length && !this.jump ? this.anchorAt() : null;
     this.memo = memo;
@@ -256,6 +260,8 @@ export class ReviewTab extends RepoView {
   }
 
   openComposer(editing, text, cx) {
+    // A comment being written isn't replaced: finish it (⌘↵) or close it (Esc) first.
+    if (this.editing && this.composer.value().trim()) { this.composer.focus(); this.say("note", "Save (⌘↵) or close (Esc) the open comment first"); cx.notify(); return; }
     this.note = null; this.done = null; this.preview = null;
     this.editing = editing;
     this.composer.set_value(text);
@@ -317,7 +323,9 @@ export class ReviewTab extends RepoView {
       try {
         const r = await hc(["send", pane.terminal, message(list)]);
         if (r.code !== 0) throw new Error((r.stderr || r.stdout).trim());
-        setComments(ck, []);
+        // Only the comments that went: one saved meanwhile stays.
+        const went = new Set(list.map((c) => JSON.stringify(c)));
+        setComments(ck, commentsOf(ck).filter((c) => !went.has(JSON.stringify(c))));
         this.preview = null;
         this.say("done", `Sent ${list.length} comment${list.length === 1 ? "" : "s"} to ${pane.program?.name ?? pane.terminal}`);
         run("tab.select", { id: pane.tab });
@@ -333,10 +341,10 @@ export class ReviewTab extends RepoView {
     if (e.key === "escape") {
       if (this.help) this.help = false; else if (this.preview) this.preview = null; else if (this.editing) this.editing = null;
       else if (this.sel) this.sel = null; else return false;
-      this.handle.focus();
+      this.focusSelf();
       return true;
     }
-    if (this.editing || this.preview) return false;
+    if (this.editing) return false;
     const m = e.modifiers;
     if (m.platform || m.control || m.alt || m.function) return false;
     const ch = e.key_char ?? e.key, page = Math.max(ROW, this.areaH - HEAD - 2 * ROW);
@@ -369,19 +377,21 @@ export class ReviewTab extends RepoView {
     if (kind === "@") return div().w_full().px(12).h(ROW).flex_none().truncate().bg(C.hunk).text_color(C.hunkText).child(text);
     const tint = kind === "+" ? C.add : kind === "-" ? C.del : null, gutter = kind === "+" ? C.addGutter : kind === "-" ? C.delGutter : null;
     return h_flex().w_full().h(ROW).flex_none()
-      .when(Boolean(tint), (e) => e.bg(tint)).when(it.selected, (e) => e.bg(t.accent + "40"))
+      .when(this.isSelected(it.i), (e) => e.bg(t.accent + "40")).when(Boolean(tint) && !this.isSelected(it.i), (e) => e.bg(tint))
       .child(div().w(44).h_full().pr(8).flex_none().flex().items_center().justify_end().text_color(t.dim)
         .when(Boolean(gutter), (e) => e.bg(gutter).text_color(t.foreground)).child(number === undefined ? "" : String(number)))
       .child(div().w(16).flex_none().text_center().text_color(t.dim).child(kind === "+" || kind === "-" ? kind : ""))
       .child(div().flex_1().min_w(0).truncate().child(text));
   }
 
+  isSelected(i) { return Boolean(this.sel) && i >= Math.min(this.sel.a, this.sel.b) && i <= Math.max(this.sel.a, this.sel.b); }
+
   // A file header: a gap, then a bar. Its own handlers: a click folds; "＋ comment" comments on the whole file.
   fileRow(id, path, folded, t, extra) {
     const { file, size } = this.headers.get(path), parts = path.split("/"), name = parts.pop(), viewed = this.viewed(path);
     return div().w_full().h(HEAD).flex_none().pt(6).bg(t.background).child(h_flex().id(id).w_full().h(HEAD - 6).pr(10).gap(8).items_center()
       .bg(t.raised).border_t(1).border_b(1).border_color(t.border).text_size(13).cursor_pointer()
-      .on_click((_e, cx) => { this.toggleFile(path); if (extra) this.jump = path; cx.notify(); })
+      .on_click((_e, cx) => { cx.stop_propagation(); this.toggleFile(path); if (extra) this.jump = path; cx.notify(); })
       .child(div().w(3).h_full().flex_none().bg(viewed ? C.green : t.accent))
       .child(div().w(12).flex_none().text_color(t.dim).child(folded ? "▸" : "▾"))
       .child(div().w(12).flex_none().font_semibold().text_color(STATUS[file.status] ?? t.dim).child(file.status))
@@ -437,7 +447,8 @@ export class ReviewTab extends RepoView {
     const can = this.canComment(), list = this.comments(), pr = prFor(target().branch), viewedMap = viewedOf(this.commentsKey);
     this.layout(list, viewedMap);
     this.applyMoves();
-    const add = this.files.reduce((n, f) => n + f.add, 0), del = this.files.reduce((n, f) => n + f.del, 0);
+    // From the loaded diff's file entries (new files' line counts are set there).
+    const add = [...this.headers.values()].reduce((n, h) => n + h.file.add, 0), del = [...this.headers.values()].reduce((n, h) => n + h.file.del, 0);
     const viewedCount = [...this.headers.values()].filter((h) => viewedMap[h.path] === h.hash).length;
     const editingAt = this.editing ? (this.editing.index >= 0 ? list[this.editing.index]?.at : this.editing.file ? `${this.editing.path} (whole file)` : anchor(this.editing.path, this.editing.rows)) : null;
 
@@ -453,7 +464,7 @@ export class ReviewTab extends RepoView {
 
     return this.notes(this.frame(t, cx)
       // Any click gives the tab the keyboard, so the review keys work (read-only tabs too).
-      .on_mouse_down("left", () => this.handle.focus())
+      .on_mouse_down("left", () => this.focusSelf())
       .child(h_flex().h(42).flex_none().px(14).gap(8).items_center().border_b(1).border_color(t.border)
         .child(div().font_semibold().flex_none().child(`${this.files.length} file${this.files.length === 1 ? "" : "s"}`))
         .when(this.files.length > 0, (e) => e.child(div().text_size(11).text_color(viewedCount ? C.green : t.dim).child(`${viewedCount}/${this.files.length} viewed`)))
@@ -478,16 +489,17 @@ export class ReviewTab extends RepoView {
           this.clamp(); cx.notify();
         })
         .on_mouse_up("left", () => { this.drag = null; })
+        .on_hover((over) => { if (!over) this.drag = null; }) // released outside: no stuck drag
         .when(this.switching(), (e) => e.opacity(0.55))
         .child(v_flex().absolute().left(0).right(0).top(this.offsets[start] - this.top)
           .children(this.items.slice(start, end).map((it, k) => this.drawItem(it, start + k, t))))
-        .when(n > 0 && this.items[head]?.type === "file", (e) => e.child(div().absolute().left(0).right(0).top(stickyTop)
+        .when(n > 0 && this.items[head]?.type === "file", (e) => e.child(div().id("sticky-wrap").absolute().left(0).right(0).top(stickyTop).on_click((_e, cx) => cx.stop_propagation())
           .child(this.fileRow("sticky", this.items[head].path, this.items[head].folded, t, true))))
         .when(thumbH > 0, (e) => e.child(div().id("thumb").absolute().right(2).top(thumbTop).w(6).h(thumbH).rounded(3).bg(t.dim + "80")
           .on_mouse_down("left", (ev, cx) => { cx.stop_propagation(); this.drag = { y: ev.position.y, top: this.top }; })))
         .when(!this.files.length, (e) => e.child(div().absolute().top(6).px(12).text_color(t.dim).child(this.error || (this.loading ? "Loading changes…" : "No changes"))))
         .when(this.help, (e) => e.child(v_flex().id("help").absolute().top(8).right(14).p(10).gap(3).rounded(8).bg(t.popover ?? t.raised).border_1().border_color(t.border)
-          .font_family(settings().ui_font_family ?? "Geist").text_size(12).on_click((_e, cx) => { this.help = false; cx.notify(); })
+          .font_family(settings().ui_font_family ?? "Geist").text_size(12).on_click((_e, cx) => { cx.stop_propagation(); this.help = false; cx.notify(); })
           .children(KEYS.map(([k, what]) => h_flex().gap(10).child(div().w(130).text_color(t.foreground).child(k)).child(div().text_color(t.dim).child(what)))))))
       .when(Boolean(this.preview), (e) => e.child(v_flex().flex_none().p(10).gap(8).border_t(1).border_color(t.border)
         .child(div().text_size(11).text_color(t.dim).child(`This goes to ${panes().find((p) => p.terminal === tied())?.program?.name ?? tied()}:`))

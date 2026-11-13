@@ -68,7 +68,10 @@ export function openTab(path) {
   if (!t.terminal) { notify({ title: "Focus a terminal first", body: "A review tab belongs to the terminal it was opened from.", level: "warning" }); return; }
   const live = new Set(terminals().filter((k) => k.state === "live").map((k) => k.address));
   const alive = (obj) => Object.fromEntries(Object.entries(obj ?? {}).filter(([k]) => live.has(k)));
-  setShared("review.open", { ...alive(shared("review.open")), ...(path ? { [t.terminal]: { path, at: Date.now() } } : {}) });
+  // No path (cmd-shift-g): drop an old sidebar click, or a new tab would jump to it.
+  const opens = alive(shared("review.open"));
+  if (path) opens[t.terminal] = { path, at: Date.now() }; else delete opens[t.terminal];
+  setShared("review.open", opens);
   const tabs = alive(tabsOf()), space = spaces().find((s) => s.active);
   const existing = tabs[t.terminal] && space?.tabs.find((x) => x.name === tabs[t.terminal].name);
   if (existing) run("tab.select", { id: existing.id });
