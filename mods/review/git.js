@@ -51,8 +51,9 @@ export function anchor(path, rows) {
   return `${path}${at ? `:${at}` : ""}${rows.every((r) => r.kind === "-") ? " (removed)" : ""}`;
 }
 
+// The message an agent gets. A comment's later lines are indented under its bullet.
 export function message(comments) {
-  return ["Review comments:", ...comments.map((c) => `- ${c.at}${c.quote ? ` \`${c.quote}\`` : ""} — ${c.text}`)].join("\n");
+  return ["Review comments:", ...comments.map((c) => `- ${c.at}${c.quote ? ` \`${c.quote}\`` : ""} — ${c.text.replace(/\n/g, "\n  ")}`)].join("\n");
 }
 
 // A short fingerprint of a file's diff, so "viewed" ends when the file changes.
@@ -64,7 +65,8 @@ const fingerprint = (lines) => {
 
 if (anchor("a.py", [{ kind: "+", number: 4 }, { kind: "+", number: 6 }]) !== "a.py:4-6"
   || anchor("a.py", [{ kind: "-", number: 9 }]) !== "a.py:9 (removed)"
-  || message([{ at: "a.py:4", quote: "x = 1", text: "why?" }]) !== "Review comments:\n- a.py:4 `x = 1` — why?"
+  || message([{ at: "a.py:4", quote: "x = 1", text: "why?" }, { at: "b.py (whole file)", quote: "", text: "split\nthis" }])
+    !== "Review comments:\n- a.py:4 `x = 1` — why?\n- b.py (whole file) — split\n  this"
   || JSON.stringify(splitDiff("diff --git a/x y b/x y\n--- a/x y\n+++ b/x y\n@@ -1 +1 @@\n-a\n+b\ndiff --git a/z b/z\n@@ -0,0 +1 @@\n+c\n"))
     !== JSON.stringify({ "x y": ["--- a/x y", "+++ b/x y", "@@ -1 +1 @@", "-a", "+b"], z: ["@@ -0,0 +1 @@", "+c"] })
   || fingerprint(["ab", "c"]) === fingerprint(["a", "bc"])) throw new Error("review self-check failed");

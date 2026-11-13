@@ -1,52 +1,98 @@
-// A review tab, tied to one terminal (props.agent): every changed file's diff in one scroll, a header per file (sticky
-// at the top), line comments sent to that agent, Viewed (cmd-e) and only-this-file (cmd-shift-e). Read-only while the
-// terminal runs no agent.
+// A review tab, tied to one terminal (props.agent): every changed file's diff in one scroll, a header per file (the
+// top file's header sticks), line and whole-file comments sent to that agent after a preview, Viewed, only-this-file,
+// and plain-letter keys (? lists them). Read-only (no comments) while the terminal runs no agent.
+// It draws only the rows on screen and owns the scroll offset, after herdr-gitview's scroller: the sticky header,
+// jumps and the reading position across refreshes are exact, and rows take their own clicks.
 import { div } from "gpui-kit";
-import { h_flex, v_flex, InputState, Input, Scrollbar, v_virtual_list, VirtualListScrollHandle } from "gpui-base";
+import { h_flex, v_flex, TextareaState, Textarea } from "gpui-base";
 import { panes, exec, hc, run, settings, shared, theme } from "herdr";
 import { mode, tied, target, key, prFor, viewedOf, setViewed, setComments, onScreen } from "./state.js";
 import { C, STATUS, anchor, message, loadDiffs } from "./git.js";
 import { RepoView } from "./repo.js";
 
-const ROW = 20, HEAD = 36; // a file header is a 6px gap plus a 30px bar
+const ROW = 20, HEAD = 36, LINE = 18, OVERSCAN = 4;
 const TONE = { bad: C.red, good: C.green };
+const KEYS = [
+  ["j k  ↓ ↑", "next / previous line"], ["shift ↓ ↑", "extend the selection"], ["J K", "next / previous file"],
+  ["space  shift-space", "page down / up"], ["g G", "top / bottom"], ["a  ⌘⇧C", "comment on the selection (double-click a line)"],
+  ["v  ⌘E", "mark the file viewed"], ["o  ⌘⇧E", "only this file"], ["p  ⌘↵", "preview the comments, again to send"],
+  ["esc", "close · clear the selection"], ["?", "these keys"],
+];
+
+// A row's identity across rebuilds: its file, kind and line number (hunk and note rows by their text).
+const rowKey = (r) => (r.kind === "file" ? `${r.path}\0file` : `${r.path}\0${r.kind}\0${r.number ?? r.text}`);
+const headerKey = (path) => `${path}\0file`;
+
+// The last item whose top is at or above y (offsets: each item's top, then the total height).
+export function indexAt(offsets, y) {
+  let lo = 0, hi = offsets.length - 2;
+  if (hi < 0) return 0;
+  while (lo < hi) { const mid = (lo + hi + 1) >> 1; if (offsets[mid] <= y) lo = mid; else hi = mid - 1; }
+  return lo;
+}
+
+// Word-wraps comment text to `width` characters per line.
+export function wrap(text, width) {
+  return text.split("\n").flatMap((p) => {
+    const out = [];
+    let line = "";
+    for (const w of p.split(" ")) {
+      line = line && (line + " " + w).length > width ? (out.push(line), w) : line ? `${line} ${w}` : w;
+      while (line.length > width) { out.push(line.slice(0, width)); line = line.slice(width); }
+    }
+    out.push(line);
+    return out;
+  });
+}
+
+if ([0, 19, 20, 75, 1000].map((y) => indexAt([0, 20, 56, 76], y)).join() !== "0,0,1,2,2" || indexAt([0], 5) !== 0
+  || wrap("aaa bbb ccc", 7).join("|") !== "aaa bbb|ccc" || wrap("x\ny", 5).join("|") !== "x|y" || wrap("abcdefghij", 4).join("|") !== "abcd|efgh|ij") throw new Error("review tab self-check failed");
 
 export class ReviewTab extends RepoView {
   constructor(cx) {
     super(cx);
-    this.scroll = VirtualListScrollHandle.new();
-    this.commentInput = InputState.new({ placeholder: "Comment · Enter saves · ⌘Enter saves and sends · Esc cancels" });
-    this.commentInput.on("submit", (e, cx) => this.saveComment(cx, e?.secondary));
-    // The sticky header follows the list's first visible row, which the list reports while drawing (no re-render there).
-    cx.timer.every(150, (cx) => { if (this.visibleStart !== this.stickyAt) cx.notify(); });
+    this.areaH = 0; this.areaW = 0;
+    this.composer = TextareaState.new({ placeholder: "Comment · ⌘↵ saves · Esc cancels" });
+    this.composer.set_auto_grow(1, 6);
+    this.composer.on("submit", (_e, cx) => this.saveComment(cx));
   }
 
   reset() {
-    Object.assign(this, { rows: [], auto: new Set(), fold: {}, only: null, sel: null, editing: null, sig: null, headers: null, memo: null, visibleStart: 0, cut: false });
+    Object.assign(this, {
+      rows: [], auto: new Set(), fold: {}, only: null, sel: null, editing: null, preview: null, help: false, sig: null, cut: false,
+      headers: new Map(), memo: null, items: [], sizes: [], offsets: [0], fileOf: [], keyIndex: new Map(), top: 0, jump: null, reveal: null,
+    });
   }
+
+  // No refresh while a comment or the send preview is open (it would move what you're writing about).
+  paused() { return Boolean(this.editing || this.preview); }
 
   async afterFiles(context) {
     const d = await loadDiffs({ root: this.root, on: this.on, files: this.files, hasHead: this.hasHead, against: this.against }, this.sig);
     if (!d || key() !== context) return;
-    Object.assign(this, { sig: d.sig, rows: d.rows, auto: d.auto, cut: d.cut, sel: null, rowsVer: (this.rowsVer ?? 0) + 1 });
+    const selKeys = this.sel && [this.rows[this.sel.a], this.rows[this.sel.b]].map((r) => r && rowKey(r));
+    Object.assign(this, { sig: d.sig, rows: d.rows, auto: d.auto, cut: d.cut, rowsVer: (this.rowsVer ?? 0) + 1 });
     this.headers = new Map(d.rows.filter((r) => r.kind === "file").map((r) => [r.path, r]));
     if (this.only && !this.headers.has(this.only)) this.only = null;
+    // The selection follows its lines; it goes when they do.
+    if (selKeys) {
+      const at = new Map(d.rows.map((r, i) => [rowKey(r), i])), a = at.get(selKeys[0]), b = at.get(selKeys[1]);
+      this.sel = a !== undefined && b !== undefined ? { a, b } : null;
+    }
   }
 
   command(name, cx) {
     super.command(name);
     if (name === "comment") this.startComment(cx);
-    if (name === "send") this.send(cx);
+    if (name === "send") this.requestSend(cx);
     if (name === "viewed") this.toggleViewed(cx);
     if (name === "only") this.toggleOnly(cx);
   }
 
-  onEscape() { if (!this.editing) return false; this.editing = null; return true; }
-
   // Comments need an agent behind the tab; checked live, so starting Claude there turns them on.
   canComment() { return Boolean(panes().find((p) => p.terminal === tied())?.status); }
 
-  viewed(path) { const h = this.headers?.get(path); return Boolean(h) && viewedOf(this.commentsKey)[path] === h.hash; }
+  viewed(path) { const h = this.headers.get(path); return Boolean(h) && viewedOf(this.commentsKey)[path] === h.hash; }
 
   // Only-this-file folds the rest; otherwise a click decides, else viewed and bulky files start folded.
   folded(path) {
@@ -54,23 +100,103 @@ export class ReviewTab extends RepoView {
     return this.fold[path] ?? (this.viewed(path) || this.auto.has(path));
   }
 
-  // The file at the top of the view (the sticky header's).
-  currentPath() {
-    const it = this.diffItems?.[this.visibleStart ?? 0];
-    return it?.row?.path ?? it?.c?.path ?? this.rows[0]?.path ?? null;
+  // ---- Layout: items, their heights and tops, and the scroll offset
+
+  // Header, the file's whole-file comments, then its rows (a folded file: header and comments only). A line comment
+  // follows the line it ends on, else its file's end (line gone or folded); comments on files no longer changed go last.
+  buildItems() {
+    const comments = this.comments(), at = new Map(), placed = new Set(), out = [];
+    const spot = (path, kind, number) => `${path}\0${kind}\0${number}`;
+    comments.forEach((c, index) => { if (c.end) { const k = spot(c.path, c.end.kind, c.end.number); at.set(k, [...(at.get(k) ?? []), index]); } });
+    const comment = (index) => { placed.add(index); out.push({ type: "comment", key: `c\0${index}\0${comments[index].text}`, c: comments[index], index, path: comments[index].path }); };
+    const rest = (path) => comments.forEach((c, index) => { if (c.path === path && !placed.has(index)) comment(index); });
+    const lo = this.sel ? Math.min(this.sel.a, this.sel.b) : -1, hi = this.sel ? Math.max(this.sel.a, this.sel.b) : -2;
+    let path = null, folded = false;
+    this.rows.forEach((row, i) => {
+      if (row.kind === "file") {
+        if (path !== null) rest(path);
+        path = row.path; folded = this.folded(path);
+        out.push({ type: "file", key: rowKey(row), row, i, folded, path });
+        comments.forEach((c, index) => { if (c.path === path && !c.end && !placed.has(index)) comment(index); });
+      } else if (!folded) {
+        out.push({ type: "row", key: rowKey(row), row, i, selected: i >= lo && i <= hi, path });
+        for (const index of at.get(spot(row.path, row.kind, row.number)) ?? []) if (!placed.has(index)) comment(index);
+      }
+    });
+    if (path !== null) rest(path);
+    comments.forEach((c, index) => { if (!placed.has(index)) comment(index); });
+    return out;
   }
+
+  // Characters per comment line at the current width (the comment font is about 7px a character).
+  commentWidth() { return Math.max(24, Math.floor((this.areaW - 90) / 7)); }
+  size(it) { return it.type === "file" ? HEAD : it.type === "comment" ? 8 + LINE * wrap(`› ${it.c.text}`, this.commentWidth()).length : ROW; }
+
+  // Rebuilds items when something they show changed, keeping the row at the top of the view where it was.
+  layout(list, viewedMap) {
+    const memo = JSON.stringify([this.rowsVer, this.fold, this.only, this.sel, list, viewedMap, Math.round(this.areaW / 20)]);
+    if (memo === this.memo) return;
+    const keep = this.items.length && !this.jump ? this.anchorAt() : null;
+    this.memo = memo;
+    this.items = this.buildItems();
+    this.sizes = this.items.map((it) => this.size(it));
+    this.offsets = [0];
+    for (const s of this.sizes) this.offsets.push(this.offsets.at(-1) + s);
+    this.keyIndex = new Map(this.items.map((it, i) => [it.key, i]));
+    let head = 0;
+    this.fileOf = this.items.map((it, i) => (it.type === "file" ? (head = i) : head));
+    if (keep) {
+      const i = this.keyIndex.get(keep.key), h = this.keyIndex.get(headerKey(keep.path));
+      this.top = i !== undefined ? this.offsets[i] + keep.offset : h !== undefined ? this.offsets[h] : this.top;
+    }
+  }
+
+  anchorAt() { const i = indexAt(this.offsets, this.top), it = this.items[i]; return { key: it?.key, path: it?.path, offset: this.top - this.offsets[i] }; }
+  total() { return this.offsets.at(-1) ?? 0; }
+  clamp() { this.top = Math.min(Math.max(0, this.top), Math.max(0, this.total() - this.areaH)); }
+
+  // Pending moves, after layout: a file header to the top; a row into view below the sticky header.
+  applyMoves() {
+    if (this.jump) {
+      const i = this.keyIndex.get(headerKey(this.jump));
+      if (i !== undefined) this.top = this.offsets[i];
+      this.jump = null;
+    }
+    if (this.reveal) {
+      const i = this.keyIndex.get(this.reveal);
+      if (i !== undefined) {
+        if (this.offsets[i] < this.top + HEAD) this.top = this.offsets[i] - HEAD - 2 * ROW;
+        else if (this.offsets[i + 1] > this.top + this.areaH) this.top = this.offsets[i + 1] - this.areaH + 2 * ROW;
+      }
+      this.reveal = null;
+    }
+    this.clamp();
+  }
+
+  // The file at the top of the view: the sticky header's.
+  topPath() { return this.items[this.fileOf[indexAt(this.offsets, this.top)]]?.path ?? null; }
+  // What cmd-e / v and cmd-shift-e / o act on: the selected line's file while it is on screen, else the top file.
+  currentPath() {
+    const i = this.sel ? this.keyIndex.get(rowKey(this.rows[this.sel.b] ?? {})) : undefined;
+    const onView = i !== undefined && this.offsets[i] >= this.top && this.offsets[i + 1] <= this.top + this.areaH;
+    return onView ? this.items[i].path : this.topPath();
+  }
+
+  // ---- Actions
 
   // A header click: fold or unfold; in only-this-file, switch to that file.
   toggleFile(path) {
     if (this.only) { this.only = path; this.jump = path; } else this.fold[path] = !this.folded(path);
   }
 
-  // cmd-e: mark the top file viewed (it folds in place, its header stays at the top and the next file follows), or unmark it.
-  toggleViewed(cx) {
-    const path = this.currentPath(), h = path && this.headers?.get(path);
+  // v / ⌘E: the current file. Viewed folds it in place: its header stays at the top and the next file follows.
+  toggleViewed(cx) { const path = this.currentPath(); if (path) this.toggleViewedPath(path, cx); }
+
+  toggleViewedPath(path, cx) {
+    const h = this.headers.get(path);
     if (!h) return;
-    const map = { ...viewedOf(this.commentsKey) }, was = map[path] === h.hash;
-    if (was) delete map[path]; else map[path] = h.hash;
+    const map = { ...viewedOf(this.commentsKey) };
+    if (map[path] === h.hash) delete map[path]; else map[path] = h.hash;
     delete this.fold[path];
     this.only = null;
     setViewed(this.commentsKey, map);
@@ -78,7 +204,7 @@ export class ReviewTab extends RepoView {
     cx.notify();
   }
 
-  // cmd-shift-e: only the top file open; again: back to all files.
+  // Only the current file open; again: back to all files.
   toggleOnly(cx) {
     const path = this.only ?? this.currentPath();
     if (!path) return;
@@ -87,11 +213,53 @@ export class ReviewTab extends RepoView {
     cx.notify();
   }
 
-  // Click picks a line, shift-click extends the selection within the same file.
-  select(i, extend, cx) {
-    const row = this.rows[i];
-    if (row?.number === undefined) return;
-    this.sel = extend && this.sel && this.rows[this.sel.a]?.path === row.path ? { ...this.sel, b: i } : { a: i, b: i };
+  // Select a line, or extend the selection within its file.
+  selectRow(i, extend) {
+    if (this.rows[i]?.number === undefined) return;
+    this.sel = extend && this.sel && this.rows[this.sel.a]?.path === this.rows[i].path ? { ...this.sel, b: i } : { a: i, b: i };
+  }
+
+  // j / k: the next or previous line with a number, from the selection or the top of the view.
+  moveLine(dir, extend) {
+    const can = (it) => it?.type === "row" && it.row.number !== undefined;
+    const cur = this.sel ? this.keyIndex.get(rowKey(this.rows[this.sel.b] ?? {})) : undefined;
+    let i = cur ?? indexAt(this.offsets, this.top + HEAD) - dir;
+    do i += dir; while (i >= 0 && i < this.items.length && !can(this.items[i]));
+    if (!can(this.items[i])) return;
+    this.selectRow(this.items[i].i, extend);
+    this.reveal = this.items[i].key;
+  }
+
+  // J / K: the next file's header to the top; back: this file's header, or the one before when already there.
+  moveFile(dir) {
+    const heads = this.items.map((it, i) => (it.type === "file" ? i : -1)).filter((i) => i >= 0);
+    const here = this.fileOf[indexAt(this.offsets, this.top)] ?? 0, k = heads.indexOf(here);
+    const to = dir > 0 ? heads[k + 1] : this.top > this.offsets[here] + 1 ? here : heads[k - 1];
+    if (to !== undefined) this.jump = this.items[to].path;
+  }
+
+  startComment(cx) {
+    if (!this.canComment()) { this.say("note", "Read-only: no agent runs in this terminal"); cx.notify(); return; }
+    const rows = this.selectedRows();
+    if (!rows.length) { this.say("note", "Select a line first: click it, shift-click for a range, or use j / k"); cx.notify(); return; }
+    this.openComposer({ index: -1, path: rows[0].path, rows }, "", cx);
+  }
+
+  startFileComment(path, cx) {
+    if (!this.canComment()) return;
+    this.openComposer({ index: -1, path, rows: [], file: true }, "", cx);
+  }
+
+  editComment(index, cx) {
+    if (!this.canComment()) return;
+    this.openComposer({ index }, this.comments()[index]?.text ?? "", cx);
+  }
+
+  openComposer(editing, text, cx) {
+    this.note = null; this.done = null; this.preview = null;
+    this.editing = editing;
+    this.composer.set_value(text);
+    this.composer.focus();
     cx.notify();
   }
 
@@ -101,37 +269,18 @@ export class ReviewTab extends RepoView {
     return this.rows.slice(lo, hi + 1).filter((r) => r.path === path && r.number !== undefined);
   }
 
-  startComment(cx) {
-    if (!this.canComment()) return;
-    const rows = this.selectedRows();
-    if (!rows.length) { this.say("note", "Select a line first: click it, shift-click for a range"); cx.notify(); return; }
-    this.note = null; this.done = null;
-    this.editing = { index: -1, path: rows[0].path, rows };
-    this.commentInput.set_value("");
-    this.commentInput.focus();
-    cx.notify();
-  }
-
-  editComment(index, cx) {
-    if (!this.canComment()) return;
-    this.editing = { index };
-    this.commentInput.set_value(this.comments()[index]?.text ?? "");
-    this.commentInput.focus();
-    cx.notify();
-  }
-
-  saveComment(cx, andSend) {
-    const e = this.editing, text = this.commentInput.value().trim(), list = [...this.comments()];
+  saveComment(cx) {
+    const e = this.editing, text = this.composer.value().trim(), list = [...this.comments()];
     if (!e) return;
-    if (e.index === -1 && text) {
+    if (e.index === -1 && text && e.file) list.push({ path: e.path, at: `${e.path} (whole file)`, quote: "", text, end: null });
+    else if (e.index === -1 && text) {
       const last = e.rows.at(-1), quote = e.rows.find((r) => r.text.trim())?.text.trim().replace(/`/g, "'").slice(0, 80) ?? "";
       list.push({ path: e.path, at: anchor(e.path, e.rows), quote, text, end: { kind: last.kind, number: last.number } });
     } else if (e.index >= 0) {
       if (text) list[e.index] = { ...list[e.index], text }; else list.splice(e.index, 1);
     }
     setComments(this.commentsKey, list);
-    this.editing = null; this.sel = null; this.handle.focus();
-    if (andSend) this.send(cx);
+    this.editing = null; this.sel = null; this.savedAt = Date.now(); this.handle.focus();
     cx.notify();
   }
 
@@ -139,6 +288,19 @@ export class ReviewTab extends RepoView {
     const list = [...this.comments()];
     list.splice(index, 1); this.editing = null;
     setComments(this.commentsKey, list);
+    this.handle.focus();
+    cx.notify();
+  }
+
+  // p / ⌘↵ / Send: while writing, save the comment; else show the exact message; with it shown, send it.
+  requestSend(cx) {
+    if (this.editing) { this.saveComment(cx); return; }
+    // ⌘↵ can reach both the comment box (save) and the review keys (send): one press only saves.
+    if (Date.now() - (this.savedAt ?? 0) < 400) return;
+    if (this.preview) { this.send(cx); return; }
+    if (!this.comments().length) { this.say("note", "No comments to send"); cx.notify(); return; }
+    if (!this.canComment()) { this.say("note", `${tied()} isn't running an agent`); cx.notify(); return; }
+    this.preview = true;
     cx.notify();
   }
 
@@ -148,7 +310,7 @@ export class ReviewTab extends RepoView {
     const list = this.comments();
     if (!list.length || this.busy) return;
     const pane = panes().find((p) => p.terminal === tied());
-    if (!pane?.status) { this.say("note", `${tied()} isn't running an agent`); cx.notify(); return; }
+    if (!pane?.status) { this.preview = null; this.say("note", `${tied()} isn't running an agent`); cx.notify(); return; }
     const ck = this.commentsKey;
     this.busy = "send"; this.note = null; this.done = null;
     cx.spawn(async (cx) => {
@@ -156,6 +318,7 @@ export class ReviewTab extends RepoView {
         const r = await hc(["send", pane.terminal, message(list)]);
         if (r.code !== 0) throw new Error((r.stderr || r.stdout).trim());
         setComments(ck, []);
+        this.preview = null;
         this.say("done", `Sent ${list.length} comment${list.length === 1 ? "" : "s"} to ${pane.program?.name ?? pane.terminal}`);
         run("tab.select", { id: pane.tab });
         run("pane.focus", { pane: pane.pane });
@@ -165,23 +328,60 @@ export class ReviewTab extends RepoView {
     cx.notify();
   }
 
-  // Rows are drawn inside the virtual list's layout, where handlers throw: clicks come through clickItem.
-  diffRow({ kind, number, text }, selected, t) {
+  // Plain-letter keys, while no comment or preview has the keyboard; ⌘ / ctrl / alt chords stay the app's.
+  onKey(e, cx) {
+    if (e.key === "escape") {
+      if (this.help) this.help = false; else if (this.preview) this.preview = null; else if (this.editing) this.editing = null;
+      else if (this.sel) this.sel = null; else return false;
+      this.handle.focus();
+      return true;
+    }
+    if (this.editing || this.preview) return false;
+    const m = e.modifiers;
+    if (m.platform || m.control || m.alt || m.function) return false;
+    const ch = e.key_char ?? e.key, page = Math.max(ROW, this.areaH - HEAD - 2 * ROW);
+    const once = (f) => { if (!e.is_held) f(); };
+    switch (ch === " " ? "space" : ch) {
+      case "j": this.moveLine(1, false); break;
+      case "k": this.moveLine(-1, false); break;
+      case "J": this.moveFile(1); break;
+      case "K": this.moveFile(-1); break;
+      case "g": this.top = 0; break;
+      case "G": this.top = this.total(); break;
+      case "a": once(() => this.startComment(cx)); break;
+      case "v": once(() => this.toggleViewed(cx)); break;
+      case "o": once(() => this.toggleOnly(cx)); break;
+      case "p": once(() => this.requestSend(cx)); break;
+      case "?": this.help = !this.help; break;
+      default:
+        if (e.key === "down" || e.key === "up") this.moveLine(e.key === "down" ? 1 : -1, m.shift);
+        else if (e.key === "space" || e.key === "pagedown" || e.key === "pageup") this.top += (e.key === "pageup" || (e.key === "space" && m.shift) ? -page : page);
+        else return false;
+    }
+    this.clamp();
+    return true;
+  }
+
+  // ---- Rows
+
+  diffRow(it, t) {
+    const { kind, number, text } = it.row;
     if (kind === "@") return div().w_full().px(12).h(ROW).flex_none().truncate().bg(C.hunk).text_color(C.hunkText).child(text);
     const tint = kind === "+" ? C.add : kind === "-" ? C.del : null, gutter = kind === "+" ? C.addGutter : kind === "-" ? C.delGutter : null;
     return h_flex().w_full().h(ROW).flex_none()
-      .when(Boolean(tint), (e) => e.bg(tint)).when(selected, (e) => e.bg(t.accent + "40"))
+      .when(Boolean(tint), (e) => e.bg(tint)).when(it.selected, (e) => e.bg(t.accent + "40"))
       .child(div().w(44).h_full().pr(8).flex_none().flex().items_center().justify_end().text_color(t.dim)
         .when(Boolean(gutter), (e) => e.bg(gutter).text_color(t.foreground)).child(number === undefined ? "" : String(number)))
       .child(div().w(16).flex_none().text_center().text_color(t.dim).child(kind === "+" || kind === "-" ? kind : ""))
       .child(div().flex_1().min_w(0).truncate().child(text));
   }
 
-  // A file header: a gap, then a bar. `extra` (the sticky copy only: handlers can't go inside the list) ends the bar.
-  fileRow({ path, file, size }, folded, t, extra) {
-    const parts = path.split("/"), name = parts.pop(), viewed = this.viewed(path);
-    return div().w_full().h(HEAD).flex_none().pt(6).bg(t.background).child(h_flex().w_full().h(HEAD - 6).pr(10).gap(8).items_center()
+  // A file header: a gap, then a bar. Its own handlers: a click folds; "＋ comment" comments on the whole file.
+  fileRow(id, path, folded, t, extra) {
+    const { file, size } = this.headers.get(path), parts = path.split("/"), name = parts.pop(), viewed = this.viewed(path);
+    return div().w_full().h(HEAD).flex_none().pt(6).bg(t.background).child(h_flex().id(id).w_full().h(HEAD - 6).pr(10).gap(8).items_center()
       .bg(t.raised).border_t(1).border_b(1).border_color(t.border).text_size(13).cursor_pointer()
+      .on_click((_e, cx) => { this.toggleFile(path); if (extra) this.jump = path; cx.notify(); })
       .child(div().w(3).h_full().flex_none().bg(viewed ? C.green : t.accent))
       .child(div().w(12).flex_none().text_color(t.dim).child(folded ? "▸" : "▾"))
       .child(div().w(12).flex_none().font_semibold().text_color(STATUS[file.status] ?? t.dim).child(file.status))
@@ -189,137 +389,119 @@ export class ReviewTab extends RepoView {
       .when(folded && !viewed, (e) => e.child(div().flex_none().text_size(11).text_color(t.dim).child(`${size.toLocaleString()} lines · folded`)))
       .when(file.add > 0, (e) => e.child(div().flex_none().text_size(11.5).text_color(C.green).child(`+${file.add}`)))
       .when(file.del > 0, (e) => e.child(div().flex_none().text_size(11.5).text_color(C.red).child(`−${file.del}`)))
-      .when(viewed && !extra, (e) => e.child(div().flex_none().px(6).rounded(4).bg(C.add).text_size(11).text_color(C.green).child("✓ Viewed")))
-      .when(Boolean(extra), (e) => e.child(extra(viewed))));
+      .when(this.canComment(), (e) => e.child(div().id(`${id}-fc`).flex_none().px(6).h(22).flex().items_center().rounded(5).text_size(11).text_color(t.dim)
+        .hover((s) => s.bg(t.hover).text_color(t.foreground)).on_click((_e, cx) => { cx.stop_propagation(); this.startFileComment(path, cx); }).child("＋ comment")))
+      .child(div().id(`${id}-v`).flex_none().px(8).h(22).flex().items_center().rounded(5).border_1().border_color(viewed ? C.green : t.border)
+        .bg(viewed ? C.add : t.background).text_size(11).text_color(viewed ? C.green : t.dim)
+        .on_click((_e, cx) => { cx.stop_propagation(); this.toggleViewedPath(path, cx); }).child(viewed ? "✓ Viewed" : "Viewed")));
   }
 
-  commentRow(c, t) {
-    return h_flex().w_full().h(ROW).flex_none().gap(6).pl(57).pr(8).items_center()
-      .bg(C.comment).border_l(3).border_color(t.accent).text_color(t.foreground).font_family(settings().ui_font_family ?? "Geist")
-      .child(div().flex_1().min_w(0).truncate().child(`› ${c.text}`));
+  commentRow(it, t) {
+    const lines = wrap(`› ${it.c.text}`, this.commentWidth());
+    return v_flex().w_full().h(8 + LINE * lines.length).flex_none().py(4).pl(57).pr(8).justify_center()
+      .bg(C.comment).border_l(3).border_color(t.accent).text_color(t.foreground).font_family(settings().ui_font_family ?? "Geist").cursor_pointer()
+      .children(lines.map((l) => div().h(LINE).truncate().child(l || " ")));
   }
 
-  // Click a file header to fold it; a line to select it, shift-click to extend, double-click to comment; a comment to edit it.
-  clickItem(key, cx) {
-    const index = Number(key.slice(1));
-    if (key[0] === "h") { const path = this.rows[index]?.path; if (path) { this.toggleFile(path); cx.notify(); } return; }
-    if (!this.canComment()) return;
-    if (key[0] === "c") { this.editComment(index, cx); return; }
-    const now = Date.now(), double = this.lastClick?.key === key && now - this.lastClick.at < 400;
-    this.lastClick = { key, at: now };
-    this.select(index, this.shift && !double, cx);
-    if (double) this.startComment(cx);
+  // Click a line to select it, shift-click to extend, double-click to comment.
+  clickRow(it, e, cx) {
+    this.selectRow(it.i, e.modifiers.shift && e.click_count < 2);
+    if (e.click_count >= 2) this.startComment(cx);
+    cx.notify();
   }
 
-  // Header and rows per file (a folded file: its header only). A comment follows the line it ends on, else its
-  // file's end (line gone or folded); comments on files no longer changed go last.
-  items() {
-    const comments = this.comments(), at = new Map(), placed = new Set(), out = [];
-    const spot = (path, kind, number) => `${path}\0${kind}\0${number}`;
-    comments.forEach((c, index) => { const k = spot(c.path, c.end?.kind, c.end?.number); at.set(k, [...(at.get(k) ?? []), { c, index }]); });
-    const rest = (path) => comments.forEach((c, index) => { if (c.path === path && !placed.has(index)) { placed.add(index); out.push({ c, index }); } });
-    const lo = this.sel ? Math.min(this.sel.a, this.sel.b) : -1, hi = this.sel ? Math.max(this.sel.a, this.sel.b) : -2;
-    let path = null, folded = false;
-    this.rows.forEach((row, i) => {
-      if (row.kind === "file") {
-        if (path !== null) rest(path);
-        path = row.path; folded = this.folded(path);
-        out.push({ row, i, folded });
-      } else if (!folded) {
-        out.push({ row, i, selected: i >= lo && i <= hi });
-        for (const h of at.get(spot(row.path, row.kind, row.number)) ?? []) if (!placed.has(h.index)) { placed.add(h.index); out.push(h); }
-      }
-    });
-    if (path !== null) rest(path);
-    comments.forEach((c, index) => { if (!placed.has(index)) out.push({ c, index }); });
-    return out;
+  drawItem(it, i, t) {
+    if (it.type === "file") return this.fileRow(`h-${i}`, it.path, it.folded, t);
+    if (it.type === "comment") return div().id(`c-${i}`).on_click((_e, cx) => this.editComment(it.index, cx)).child(this.commentRow(it, t));
+    return div().id(`r-${i}`).on_click((e, cx) => this.clickRow(it, e, cx)).child(this.diffRow(it, t));
   }
 
-  // "top" only scrolls to the nearest edge. A header above the view lands at the top; for one at or below the top,
-  // bring into view the row a screen further down, which leaves the header at the top (under its sticky copy).
-  scrollToJump(cx) {
-    const i = this.diffItems.findIndex((it) => it.row?.kind === "file" && it.row.path === this.jump);
-    this.jump = null;
-    if (i < 0) return;
-    let j = i, h = this.sizes[i];
-    if (i >= (this.visibleStart ?? 0)) while (j + 1 < this.sizes.length && h < (this.areaH ?? 0)) h += this.sizes[++j];
-    this.scroll.scroll_to_item(j, "top");
-    cx.timer.after(100, (cx) => cx.notify());
-  }
+  // ---- Render
 
   render(cx) {
     this.catchUp(cx);
-    // Opening the tab, or switching back to it, gives it the keyboard so the review keys work at once
-    // (after this render, so Herdr's own focus change for the tab has landed).
+    // Opening the tab, or coming back to it, gives it the keyboard. Herdr hands focus over after it draws, so ask
+    // again for up to a second (after herdr-gitview), unless a comment is being written or the tab went away.
     const shown = onScreen();
-    if (shown && !this.wasShown) cx.timer.after(16, () => { try { this.handle.focus(); } catch { /* a click still focuses */ } });
+    if (shown && !this.wasShown) {
+      for (let k = 1; k <= 10; k++) cx.timer.after(100 * k, () => { if (onScreen() && !this.editing && !this.handle.is_focused()) this.handle.focus(); });
+    }
     this.wasShown = shown;
     const t = theme();
-    // A sidebar click sets review.open to {path, at}: unfold that file and scroll to its header, once per click.
+    // A sidebar click sets review.open to {path, at}: unfold that file and bring its header to the top, once per click.
     const want = (shared("review.open") ?? {})[tied()];
-    if (want?.at && want.at !== this.jumped && this.headers?.has(want.path)) {
+    if (want?.at && want.at !== this.jumped && this.headers.has(want.path)) {
       this.jumped = want.at; this.jump = want.path;
       if (this.only) this.only = want.path; else this.fold[want.path] = false;
     }
     const can = this.canComment(), list = this.comments(), pr = prFor(target().branch), viewedMap = viewedOf(this.commentsKey);
+    this.layout(list, viewedMap);
+    this.applyMoves();
     const add = this.files.reduce((n, f) => n + f.add, 0), del = this.files.reduce((n, f) => n + f.del, 0);
-    const viewedCount = [...(this.headers?.values() ?? [])].filter((h) => viewedMap[h.path] === h.hash).length;
-    const editingAt = this.editing ? (this.editing.index >= 0 ? list[this.editing.index]?.at : anchor(this.editing.path, this.editing.rows)) : null;
-    // The virtual list keeps its first callbacks, so they read this.diffItems (live), never a render-local list.
-    // Rebuilt only when something it shows changed: wheel and timer re-renders (sticky header) stay cheap.
-    const memo = JSON.stringify([this.rowsVer, this.fold, this.only, this.sel, list, viewedMap]);
-    if (memo !== this.memo) {
-      this.memo = memo;
-      this.diffItems = this.items();
-      this.sizes = this.diffItems.map((it) => (it.row?.kind === "file" ? HEAD : ROW));
-    }
-    if (this.jump) this.scrollToJump(cx);
-    const itemKey = (i) => { const it = this.diffItems[i]; return !it ? `x${i}` : !it.row ? `c${it.index}` : `${it.row.kind === "file" ? "h" : "r"}${it.i}`; };
-    const itemRow = (it) => (!it.row ? this.commentRow(it.c, theme()) : it.row.kind === "file" ? this.fileRow(it.row, it.folded, theme()) : this.diffRow(it.row, it.selected, theme()));
-    // The list draws once to measure a row (a one-item range): only a real range moves the sticky header.
-    const drawRange = (range) => { if (range.end - range.start > 1) this.visibleStart = range.start; return this.diffItems.slice(range.start, range.end).map(itemRow); };
-    this.stickyAt = this.visibleStart;
-    const stickyPath = this.diffItems.length ? this.currentPath() : null, sticky = stickyPath && this.headers?.get(stickyPath);
-    const viewedBox = (viewed) => div().id("sticky-viewed").flex_none().px(8).h(22).flex().items_center().gap(4).rounded(5).border_1()
-      .border_color(viewed ? C.green : t.border).bg(viewed ? C.add : t.background).text_size(11).text_color(viewed ? C.green : t.dim).cursor_pointer()
-      .on_click((_e, cx) => { cx.stop_propagation(); this.toggleViewed(cx); }).child(viewed ? "✓ Viewed" : "Viewed ⌘E");
+    const viewedCount = [...this.headers.values()].filter((h) => viewedMap[h.path] === h.hash).length;
+    const editingAt = this.editing ? (this.editing.index >= 0 ? list[this.editing.index]?.at : this.editing.file ? `${this.editing.path} (whole file)` : anchor(this.editing.path, this.editing.rows)) : null;
+
+    // The rows on screen, placed at their offsets; the sticky header is the top file's, pushed up by the next header.
+    const n = this.items.length, first = indexAt(this.offsets, this.top);
+    const start = Math.max(0, first - OVERSCAN), end = Math.min(n, indexAt(this.offsets, this.top + this.areaH) + 1 + OVERSCAN);
+    const head = this.fileOf[first], next = this.fileOf.findIndex((h, i) => i > first && h !== head && this.items[i].type === "file");
+    const stickyTop = next > 0 ? Math.min(0, this.offsets[next] - this.top - HEAD) : 0;
+    const total = this.total(), thumbH = total > this.areaH ? Math.max(24, (this.areaH * this.areaH) / total) : 0;
+    const thumbTop = thumbH ? (this.top / (total - this.areaH)) * (this.areaH - thumbH) : 0;
     const button = (id, label, on, action) => div().id(id).h(32).px(14).flex().items_center().rounded(8).bg(on ? t.solid : t.raised).text_color(on ? t.solid_foreground : t.dim).text_size(12).when(on, (e) => e.cursor_pointer()).on_click(action).child(label);
+    const chip = (id, label, color, action) => div().id(id).px(6).py(1).rounded(4).border_1().border_color(t.border).text_size(11).text_color(color ?? t.dim).cursor_pointer().hover((s) => s.bg(t.hover)).on_click(action).child(label);
+
     return this.notes(this.frame(t, cx)
-      // Any click gives the tab the keyboard, so cmd-e and the other review keys work (read-only tabs too).
+      // Any click gives the tab the keyboard, so the review keys work (read-only tabs too).
       .on_mouse_down("left", () => this.handle.focus())
-      .on_modifiers_changed((e) => { this.shift = e.modifiers.shift; })
       .child(h_flex().h(42).flex_none().px(14).gap(8).items_center().border_b(1).border_color(t.border)
         .child(div().font_semibold().flex_none().child(`${this.files.length} file${this.files.length === 1 ? "" : "s"}`))
         .when(this.files.length > 0, (e) => e.child(div().text_size(11).text_color(viewedCount ? C.green : t.dim).child(`${viewedCount}/${this.files.length} viewed`)))
-        .when(Boolean(this.only), (e) => e.child(div().id("only").px(6).py(1).rounded(4).bg(t.selected).text_size(11).cursor_pointer()
-          .on_click((_e, cx) => this.toggleOnly(cx)).child("one file · ⌘⇧E for all")))
+        .when(Boolean(this.only), (e) => e.child(chip("only", "one file · o for all", t.foreground, (_e, cx) => this.toggleOnly(cx))))
         .when(add > 0, (e) => e.child(div().text_size(11).text_color(C.green).child(`+${add}`)))
         .when(del > 0, (e) => e.child(div().text_size(11).text_color(C.red).child(`−${del}`)))
         .child(div().text_size(10.5).text_color(t.dim).child(mode() === "branch" ? `vs ${this.baseName ?? "origin/main"}` : "uncommitted"))
-        .when(Boolean(pr), (e) => e.child(div().id("pr").px(6).py(1).rounded(4).border_1().border_color(t.border).text_size(11).text_color(TONE[pr.tone] ?? t.muted)
-          .cursor_pointer().hover((s) => s.bg(t.hover)).on_click(() => { exec("open", [pr.url]).catch(() => null); }).child(pr.label ?? `#${pr.number}`)))
+        .when(Boolean(pr), (e) => e.child(chip("pr", pr.label ?? `#${pr.number}`, TONE[pr.tone] ?? t.muted, () => { exec("open", [pr.url]).catch(() => null); })))
         .child(div().flex_1())
+        .child(chip("keys", "? keys", null, (_e, cx) => { this.help = !this.help; cx.notify(); }))
         .when(!can, (e) => e.child(div().px(6).py(1).rounded(4).border_1().border_color(t.border).text_size(10.5).text_color(t.dim).child("read-only · not an agent")))
         .when(can && list.length > 0, (e) => e.child(div().id("send").h(26).px(10).flex().items_center().rounded(6).bg(this.busy ? t.raised : t.solid).text_color(this.busy ? t.dim : t.solid_foreground).text_size(12).cursor_pointer()
-          .on_click((_e, cx) => this.send(cx)).child(this.busy === "send" ? "Sending…" : `Send ${list.length} ⌘↵`))))
+          .on_click((_e, cx) => this.requestSend(cx)).child(this.busy === "send" ? "Sending…" : `Send ${list.length} ⌘↵`))))
       .when(Boolean(this.baseNote), (e) => e.child(div().px(12).py(4).text_size(11).text_color(t.dim).child(this.baseNote)))
       .when(this.cut, (e) => e.child(div().px(12).py(4).text_size(11).text_color(t.dim).child("Over 50,000 diff lines: later files show their header only")))
-      // No sideways scroll around the list: it took the wheel. Long lines are cut with "…".
-      .child(div().id("diff-area").flex_1().min_h(0).min_w(0).relative().font_family(settings().font_family ?? "JetBrains Mono").text_size(12)
-        .on_scroll_wheel((_e, cx) => cx.notify()).on_size_change((size) => { this.areaH = size.height; })
-        .child(v_virtual_list("changes-diff", this.diffItems.length, this.sizes, itemKey, drawRange)
-          .track_scroll(this.scroll).size_full().on_item_click((key, cx) => this.clickItem(key, cx)))
-        // Sticky header: a copy of the top file's header over the list; a click folds that file and goes to its header.
-        .when(Boolean(sticky), (e) => e.child(div().id("sticky").absolute().top(0).left(0).right(0)
-          .on_click((_e, cx) => { this.toggleFile(stickyPath); this.jump = stickyPath; cx.notify(); })
-          .child(this.fileRow(sticky, this.folded(stickyPath), t, viewedBox))))
-        .child(Scrollbar.vertical("changes-diff").viewport_from_layout().absolute().inset_0())
-        .when(!this.files.length, (e) => e.child(div().absolute().top(6).px(12).text_color(t.dim).child(this.error || (this.loading ? "Loading changes…" : "No changes")))))
+      .child(div().id("diff-area").flex_1().min_h(0).min_w(0).relative().overflow_hidden().font_family(settings().font_family ?? "JetBrains Mono").text_size(12)
+        .on_size_change((size, cx) => { if (size.height !== this.areaH || size.width !== this.areaW) { this.areaH = size.height; this.areaW = size.width; cx.notify(); } })
+        .on_scroll_wheel((e, cx) => { const before = this.top; this.top -= e.delta.y; this.clamp(); if (this.top !== before) cx.notify(); })
+        .on_mouse_move((e, cx) => {
+          if (!this.drag) return;
+          this.top = this.drag.top + (e.position.y - this.drag.y) * (total - this.areaH) / Math.max(1, this.areaH - thumbH);
+          this.clamp(); cx.notify();
+        })
+        .on_mouse_up("left", () => { this.drag = null; })
+        .when(this.switching(), (e) => e.opacity(0.55))
+        .child(v_flex().absolute().left(0).right(0).top(this.offsets[start] - this.top)
+          .children(this.items.slice(start, end).map((it, k) => this.drawItem(it, start + k, t))))
+        .when(n > 0 && this.items[head]?.type === "file", (e) => e.child(div().absolute().left(0).right(0).top(stickyTop)
+          .child(this.fileRow("sticky", this.items[head].path, this.items[head].folded, t, true))))
+        .when(thumbH > 0, (e) => e.child(div().id("thumb").absolute().right(2).top(thumbTop).w(6).h(thumbH).rounded(3).bg(t.dim + "80")
+          .on_mouse_down("left", (ev, cx) => { cx.stop_propagation(); this.drag = { y: ev.position.y, top: this.top }; })))
+        .when(!this.files.length, (e) => e.child(div().absolute().top(6).px(12).text_color(t.dim).child(this.error || (this.loading ? "Loading changes…" : "No changes"))))
+        .when(this.help, (e) => e.child(v_flex().id("help").absolute().top(8).right(14).p(10).gap(3).rounded(8).bg(t.popover ?? t.raised).border_1().border_color(t.border)
+          .font_family(settings().ui_font_family ?? "Geist").text_size(12).on_click((_e, cx) => { this.help = false; cx.notify(); })
+          .children(KEYS.map(([k, what]) => h_flex().gap(10).child(div().w(130).text_color(t.foreground).child(k)).child(div().text_color(t.dim).child(what)))))))
+      .when(Boolean(this.preview), (e) => e.child(v_flex().flex_none().p(10).gap(8).border_t(1).border_color(t.border)
+        .child(div().text_size(11).text_color(t.dim).child(`This goes to ${panes().find((p) => p.terminal === tied())?.program?.name ?? tied()}:`))
+        .child(div().max_h(180).child(v_flex().id("preview").max_h(180).overflow_y_scrollbar().p(8).rounded(6).bg(t.raised).font_family(settings().font_family ?? "JetBrains Mono").text_size(11.5)
+          .children(message(list).split("\n").map((l) => div().child(l || " ")))))
+        .child(h_flex().gap(8).child(div().flex_1())
+          .child(button("preview-cancel", "Cancel", false, (_e, cx) => { this.preview = null; this.handle.focus(); cx.notify(); }))
+          .child(button("preview-send", this.busy === "send" ? "Sending…" : "Send ⌘↵", true, (_e, cx) => this.send(cx))))))
       .when(Boolean(this.editing), (e) => e.child(v_flex().flex_none().p(10).gap(6).border_t(1).border_color(t.border)
         .child(div().text_size(11).text_color(t.dim).child(`Comment on ${editingAt ?? ""}`))
-        .child(h_flex().gap(8)
-          .child(div().id("comment-input").flex_1().min_w(0).h(32).px(10).flex().items_center().rounded(8).border_1().border_color(t.accent).cursor_text().on_mouse_down("left", (_e, cx) => cx.stop_propagation()).child(Input.new(this.commentInput).h_full().text_size(12).text_color(t.foreground)))
+        .child(h_flex().gap(8).items_end()
+          .child(div().id("comment-input").flex_1().min_w(0).px(10).py(6).rounded(8).border_1().border_color(t.accent).cursor_text()
+            .on_mouse_down("left", (_e, cx) => cx.stop_propagation()).child(Textarea.new(this.composer).w_full().text_size(12).text_color(t.foreground)))
           .when(this.editing?.index >= 0, (e) => e.child(button("comment-delete", "Delete", false, (_e, cx) => this.deleteComment(this.editing.index, cx))))
-          .child(button("comment-save", "Save", true, (_e, cx) => this.saveComment(cx, false)))))), t);
+          .child(button("comment-save", "Save ⌘↵", true, (_e, cx) => this.saveComment(cx)))))), t);
   }
 }

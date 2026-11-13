@@ -23,7 +23,7 @@ export class ReviewList extends RepoView {
   }
 
   reset() { this.message = ""; this.input?.set_value(""); }
-  onEscape() { if (!this.typing) return false; this.typing = false; return true; }
+  onKey(e) { if (e.key !== "escape" || !this.typing) return false; this.typing = false; this.handle.focus(); return true; }
 
   commit(cx) {
     if (!this.message.trim() || !this.root || this.busy || this.loading || this.context !== key()) return;
@@ -64,7 +64,7 @@ export class ReviewList extends RepoView {
       .when(Boolean(this.baseNote), (e) => e.child(div().px(12).py(4).text_size(11).text_color(t.dim).child(this.baseNote)))
       .when(mode() === "branch" && Boolean(this.baseName), (e) => e.child(div().px(14).pt(6).text_size(10.5).text_color(t.dim).child(`vs ${this.baseName}`)))
       .child(div().flex_1().min_h(0).relative()
-        .child(v_flex().id("changes-list").absolute().inset_0().overflow_y_scroll().p(6).children(this.files.map((f) => {
+        .child(v_flex().id("changes-list").absolute().inset_0().overflow_y_scroll().p(6).when(this.switching(), (e) => e.opacity(0.55)).children(this.files.map((f) => {
           const parts = f.path.split("/"), name = parts.pop();
           return h_flex().id(`change-${f.path}`).h(28).flex_none().px(8).gap(8).items_center().rounded(7).cursor_pointer()
             .when(openPath === f.path, (e) => e.bg(t.selected)).hover((s) => s.bg(t.hover)).on_click(() => openTab(f.path))

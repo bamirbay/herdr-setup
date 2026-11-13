@@ -58,14 +58,19 @@ Or tell your Claude: "add the Herdr setup from this repo".
 | `cmd-shift-i` / `cmd-shift-l` | PR pane / Linear pane (again: hide) |
 | `cmd-shift-s` | Open the focused agent's newest sub-agent to the right |
 
-In the review tab, click the diff first so these keys reach it:
+The review tab takes the keyboard when it opens (or after any click in it). Its keys, while no comment is being written
+(`?` shows them in the tab):
 
 | Key | Action |
 |---|---|
-| `cmd-shift-c` | Comment on the selected line or lines (click a line, shift-click for a range, double-click to comment) |
-| `cmd-enter` | Send all comments to the agent |
-| `cmd-e` | Mark the top file viewed |
-| `cmd-shift-e` | Show only this file (again: show all) |
+| `j` / `k`, `↓` / `↑` | Next / previous line (`shift-↓` / `shift-↑` extend the selection) |
+| `J` / `K` | Next / previous file |
+| `space` / `shift-space`, `g` / `G` | Page down / up, top / bottom |
+| `a`, `cmd-shift-c`, double-click | Comment on the selected lines; a header's "＋ comment" comments on the whole file |
+| `p`, `cmd-enter` | Preview the message for the agent; again to send. In the comment box `cmd-enter` saves |
+| `v`, `cmd-e` | Mark the file viewed (it folds in place; it reopens if the file changes) |
+| `o`, `cmd-shift-e` | Show only this file (again: show all) |
+| `esc` | Close the help, preview or comment box, or clear the selection |
 
 ## What it runs
 
