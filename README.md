@@ -38,8 +38,6 @@ A Herdr window for working with coding agents:
    - If your tools come from mise, add `eval "$(mise activate zsh --shims)"` to `~/.zprofile`.
      Without it, Claude hooks fail with `node: command not found` in agents started by `hc`.
      It takes effect after `hc server stop && hc server start`, which ends running agents.
-   - The `cmd-j` switcher is [herdr-recall](https://github.com/shihyuho/herdr-recall) (third-party, not in this repo; read at 92dbdd3).
-     Clone it and run its `./install.sh`, then press `cmd-j` once to start it.
 
 Or tell your Claude: "add the Herdr setup from this repo".
 
@@ -59,7 +57,6 @@ Or tell your Claude: "add the Herdr setup from this repo".
 | `cmd-shift-g` | Review tab for the focused terminal |
 | `cmd-shift-i` / `cmd-shift-l` | PR pane / Linear pane (again: hide) |
 | `cmd-shift-s` | Open the focused agent's newest sub-agent to the right |
-| `cmd-j` | Recent switcher (herdr-recall): spaces, tabs, panes and agents, most recent first; `cmd-j` `enter` goes back |
 
 The review tab takes the keyboard when it opens (or after any click in it). Its keys, while no comment is being written
 (`?` shows them in the tab):
