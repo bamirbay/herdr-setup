@@ -18,11 +18,11 @@ export default class Review extends View {
       return;
     }
     this.view = tied() ? new ReviewTab(cx) : new ReviewList(cx);
-    // keys.json "mod:review": review.comment / send / viewed / only (the tab), review.open; "focus" from pane.go.
+    // keys.json "mod:review": review.comment / send / viewed / only (the tab); "focus" from pane.go.
     cx.spawn(async (cx) => {
       for (;;) {
         const command = (await nextCommand()).split(/[.:]/).pop();
-        if (command === "open") openTab(); else this.view.command(command, cx);
+        this.view.command(command, cx);
         cx.notify();
       }
     });

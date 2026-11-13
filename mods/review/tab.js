@@ -4,7 +4,7 @@
 import { div } from "gpui-kit";
 import { h_flex, v_flex, InputState, Input, Scrollbar, v_virtual_list, VirtualListScrollHandle } from "gpui-base";
 import { panes, exec, hc, run, settings, shared, theme } from "herdr";
-import { mode, tied, target, key, prFor, viewedOf, setViewed, setComments } from "./state.js";
+import { mode, tied, target, key, prFor, viewedOf, setViewed, setComments, onScreen } from "./state.js";
 import { C, STATUS, anchor, message, loadDiffs } from "./git.js";
 import { RepoView } from "./repo.js";
 
@@ -249,6 +249,11 @@ export class ReviewTab extends RepoView {
 
   render(cx) {
     this.catchUp(cx);
+    // Opening the tab, or switching back to it, gives it the keyboard so the review keys work at once
+    // (after this render, so Herdr's own focus change for the tab has landed).
+    const shown = onScreen();
+    if (shown && !this.wasShown) cx.timer.after(16, () => { try { this.handle.focus(); } catch { /* a click still focuses */ } });
+    this.wasShown = shown;
     const t = theme();
     // A sidebar click sets review.open to {path, at}: unfold that file and scroll to its header, once per click.
     const want = (shared("review.open") ?? {})[tied()];
