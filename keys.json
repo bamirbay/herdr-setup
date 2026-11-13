@@ -70,11 +70,11 @@
     "cmd-shift-g": "mod.open:review",
     "cmd-l": "mod.open:my-spaces",
     "cmd-shift-t": { "command": "tab.new", "args": { "argv": ["claude"] } },
-    "cmd-shift-s": "my-agents.beside"
+    "cmd-shift-s": "my-tabs.beside"
   },
   "layout:my-main": {
-    "cmd-w": "my-agents.close",
-    "cmd-shift-w": "my-agents.close"
+    "cmd-w": "my-tabs.close",
+    "cmd-shift-w": "my-tabs.close"
   },
   "mod:review": {
     "cmd-shift-c": "review.comment",

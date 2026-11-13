@@ -1,6 +1,29 @@
 import { View, div, svg, image } from "gpui-kit";
 import { h_flex } from "gpui-base";
-import { spaces, panes, run, openOverlay, theme, window, shared, layout, settings } from "herdr";
+import { spaces, panes, terminals, focused, run, openOverlay, theme, window, shared, layout, settings, nextCommand, notify } from "herdr";
+
+// cmd-w / cmd-shift-w (keys.json "layout:my-main"; the tab bar is always on screen, so its commands always arrive): a sub-agent's pane is parked, so it keeps running under its
+// parent; any other pane closes, except a space's last one: spaces close by hand.
+function closePane() {
+  const f = focused();
+  if (!f?.pane) return;
+  const term = f.terminal && terminals().find((k) => k.address === f.terminal);
+  if (term?.parent && term.state === "live") { run("terminal.park", { terminal: term.address }); return; }
+  const space = spaces().find((s) => s.id === f.space), tabs = new Set((space?.tabs ?? []).map((t) => t.id));
+  if (panes().filter((p) => tabs.has(p.tab)).length <= 1) { notify({ title: "Spaces close by hand", body: "This is the space's last pane.", level: "info" }); return; }
+  run("pane.close", { pane: f.pane });
+}
+
+// cmd-shift-s: the focused agent's newest sub-agent without a pane, opened to the right of the focused pane.
+function beside() {
+  const me = focused()?.terminal, shown = new Set(panes().map((p) => p.terminal));
+  // shortcut: addresses count up in base 36 (t9, ta, …, t1j), so the highest is the newest; use a start time if hc ls gets one.
+  const n = (a) => parseInt(a.replace(/^.*\//, "").slice(1), 36);
+  const kid = terminals().filter((k) => me && k.parent === me && k.state === "live" && !shown.has(k.address)).sort((a, b) => n(b.address) - n(a.address))[0];
+  if (kid) run("terminal.keep", { terminal: kid.address, place: "right" });
+  else notify({ title: "No sub-agent to open", body: "The focused agent has no running sub-agent without a pane.", level: "info" });
+}
+if (parseInt("1j", 36) <= parseInt("z", 36)) throw new Error("my-tabs self-check failed");
 
 function find(node, id) {
   if (node?.id === id) return node;
@@ -12,8 +35,20 @@ function find(node, id) {
 }
 
 export default class Tabs extends View {
-  init() {
+  init(_props, cx) {
     this.pressed = null;
+    cx.spawn(async (cx) => {
+      for (;;) {
+        const command = (await nextCommand()).split(/[.:]/).pop();
+        try {
+          if (command === "close") closePane();
+          if (command === "beside") beside();
+        } catch (e) {
+          notify({ title: `${command} failed`, body: String(e?.message ?? e).slice(0, 300), level: "error" });
+        }
+        cx.notify();
+      }
+    });
     this.panels = JSON.parse(localStorage.getItem("panels") ?? "{}");
   }
 
