@@ -89,7 +89,9 @@ export default class Pane extends View {
   // The branch's issue key and PR, each opening on click.
   links(t, p) {
     const branch = p.branch, key = issueKey(branch);
-    const all = shared("work.prs"), pr = branch && !/^(main|master)$/.test(branch) ? [...(all?.open ?? []), ...(all?.merged ?? [])].find((x) => x.branch === branch) : null;
+    // The PR must be in this folder's repo too (a folder named like it): two repos can share a branch name.
+    const all = shared("work.prs"), parts = (p.cwd ?? "").split("/");
+    const pr = branch && !/^(main|master)$/.test(branch) ? [...(all?.open ?? []), ...(all?.merged ?? [])].find((x) => x.branch === branch && parts.includes(x.repo)) : null;
     const link = (id, label, color, open) => div().id(id).flex_none().px(5).h(18).flex().items_center().rounded(4).border_1().border_color(t.border)
       .text_size(11).text_color(color).cursor_pointer().hover((s) => s.bg(t.hover).text_color(t.foreground))
       .on_click((_e, cx) => { cx.stop_propagation(); open(); }).child(label);

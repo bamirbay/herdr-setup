@@ -431,10 +431,14 @@ export class ReviewTab extends RepoView {
   render(cx) {
     this.catchUp(cx);
     // Opening the tab, or coming back to it, gives it the keyboard. Herdr hands focus over after it draws, so ask
-    // again for up to a second (after herdr-gitview), unless a comment is being written or the tab went away.
+    // again for up to a second (after herdr-gitview), until it lands once: a later click elsewhere keeps its focus.
     const shown = onScreen();
     if (shown && !this.wasShown) {
-      for (let k = 1; k <= 10; k++) cx.timer.after(100 * k, () => { if (onScreen() && !this.editing && !this.handle.is_focused()) this.handle.focus(); });
+      this.got = false;
+      for (let k = 1; k <= 10; k++) cx.timer.after(100 * k, () => {
+        if (this.handle.is_focused()) this.got = true;
+        else if (!this.got && onScreen() && !this.editing) this.handle.focus();
+      });
     }
     this.wasShown = shown;
     const t = theme();
@@ -444,7 +448,7 @@ export class ReviewTab extends RepoView {
       this.jumped = want.at; this.jump = want.path;
       if (this.only) this.only = want.path; else this.fold[want.path] = false;
     }
-    const can = this.canComment(), list = this.comments(), pr = prFor(target().branch), viewedMap = viewedOf(this.commentsKey);
+    const can = this.canComment(), list = this.comments(), pr = prFor(target()), viewedMap = viewedOf(this.commentsKey);
     this.layout(list, viewedMap);
     this.applyMoves();
     // From the loaded diff's file entries (new files' line counts are set there).
@@ -481,11 +485,15 @@ export class ReviewTab extends RepoView {
       .when(Boolean(this.baseNote), (e) => e.child(div().px(12).py(4).text_size(11).text_color(t.dim).child(this.baseNote)))
       .when(this.cut, (e) => e.child(div().px(12).py(4).text_size(11).text_color(t.dim).child("Over 50,000 diff lines: later files show their header only")))
       .child(div().id("diff-area").flex_1().min_h(0).min_w(0).relative().overflow_hidden().font_family(settings().font_family ?? "JetBrains Mono").text_size(12)
-        .on_size_change((size, cx) => { if (size.height !== this.areaH || size.width !== this.areaW) { this.areaH = size.height; this.areaW = size.width; cx.notify(); } })
-        .on_scroll_wheel((e, cx) => { const before = this.top; this.top -= e.delta.y; this.clamp(); if (this.top !== before) cx.notify(); })
+        // Sizes, wheel deltas and pointer positions come in window px; rows are laid out in px at zoom 1 (as the picker does).
+        .on_size_change((size, cx) => {
+          const h = size.height / settings().zoom, w = size.width / settings().zoom;
+          if (h !== this.areaH || w !== this.areaW) { this.areaH = h; this.areaW = w; cx.notify(); }
+        })
+        .on_scroll_wheel((e, cx) => { const before = this.top; this.top -= e.delta.y / settings().zoom; this.clamp(); if (this.top !== before) cx.notify(); })
         .on_mouse_move((e, cx) => {
           if (!this.drag) return;
-          this.top = this.drag.top + (e.position.y - this.drag.y) * (total - this.areaH) / Math.max(1, this.areaH - thumbH);
+          this.top = this.drag.top + ((e.position.y - this.drag.y) / settings().zoom) * (total - this.areaH) / Math.max(1, this.areaH - thumbH);
           this.clamp(); cx.notify();
         })
         .on_mouse_up("left", () => { this.drag = null; })

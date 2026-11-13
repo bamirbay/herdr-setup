@@ -2,8 +2,10 @@ import { View, div, svg, image } from "gpui-kit";
 import { h_flex } from "gpui-base";
 import { spaces, panes, terminals, focused, run, openOverlay, theme, window, shared, layout, settings, nextCommand, notify } from "herdr";
 
-// cmd-w / cmd-shift-w (keys.json "layout:my-main"; the tab bar is always on screen, so its commands always arrive): a sub-agent's pane is parked, so it keeps running under its
-// parent; any other pane closes, except a space's last one: spaces close by hand.
+// cmd-w / cmd-shift-w and the pane header's ✕ (keys.json "layout:my-main"; the tab bar is always on screen, so its commands always arrive):
+// a sub-agent's pane is parked, so it keeps running under its parent; a terminal's pane closes after a confirmation
+// (Enter closes, Esc doesn't: closing ends what runs there); a mod's pane closes at once; a space's last pane stays:
+// spaces close by hand.
 function closePane() {
   const f = focused();
   if (!f?.pane) return;
@@ -11,7 +13,10 @@ function closePane() {
   if (term?.parent && term.state === "live") { run("terminal.park", { terminal: term.address }); return; }
   const space = spaces().find((s) => s.id === f.space), tabs = new Set((space?.tabs ?? []).map((t) => t.id));
   if (panes().filter((p) => tabs.has(p.tab)).length <= 1) { notify({ title: "Spaces close by hand", body: "This is the space's last pane.", level: "info" }); return; }
-  run("pane.close", { pane: f.pane });
+  const pane = panes().find((p) => p.pane === f.pane), close = { name: "pane.close", args: { pane: f.pane } };
+  if (!pane?.terminal) { run(close.name, close.args); return; }
+  const what = pane.status ? `the agent ${pane.title?.replace(/^[^\p{L}\p{N}]+/u, "").trim() || pane.program?.name || pane.terminal}` : pane.program?.name ?? "the terminal";
+  openOverlay({ mod: "confirm", kind: "dialog", width: 420, height: 160, props: { title: "Close this pane?", detail: `This ends ${what}.`, command: close } });
 }
 
 // cmd-shift-s: the focused agent's newest sub-agent without a pane, opened to the right of the focused pane.

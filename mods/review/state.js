@@ -24,17 +24,18 @@ export function target() {
   return { terminal, cwd: pane?.cwd || f?.cwd || space?.folder, on, branch: branchOf(terminal) };
 }
 
-// The branch's PR, from the work badge's poll (your open PRs and last week's merged ones).
+// The PR of a target's branch, from the work badge's poll (your open PRs and last week's merged ones). The repo must
+// match too (a folder named like it, as clones and <repo>/.worktrees/* are): two repos can share a branch name.
 // shortcut: PRs you didn't open aren't there, so their review compares with origin/main; ask gh per branch if that matters.
-export function prFor(branch) {
+export function prFor({ branch, cwd }) {
   if (!branch || /^(main|master)$/.test(branch)) return null;
-  const all = shared("work.prs");
-  return [...(all?.open ?? []), ...(all?.merged ?? [])].find((p) => p.branch === branch) ?? null;
+  const all = shared("work.prs"), parts = (cwd ?? "").split("/");
+  return [...(all?.open ?? []), ...(all?.merged ?? [])].find((p) => p.branch === branch && parts.includes(p.repo)) ?? null;
 }
 
 // What a review shows depends on these; any change starts it over. The PR's base is in it, so a stacked PR's
 // review compares with its base branch from the first load.
-export const key = () => { const t = target(); return JSON.stringify([t.cwd, t.on, mode(), prFor(t.branch)?.base ?? null]); };
+export const key = () => { const t = target(); return JSON.stringify([t.cwd, t.on, mode(), prFor(t)?.base ?? null]); };
 
 // Per-repo maps in shared state (an empty value removes the repo's entry).
 const getIn = (name, ck, fallback) => (shared(name) ?? {})[ck] ?? fallback;

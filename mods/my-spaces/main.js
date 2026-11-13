@@ -96,13 +96,15 @@ export default class Spaces extends View {
     for (const state of Object.values(this.reconnecting)) state.busy = false;
     this.folded = new Set(JSON.parse(localStorage.getItem("machines.folded") ?? "[]"));
     this.refreshMachines(cx);
-    cx.timer.every(15000, cx => this.refreshMachines(cx));
+    cx.timer.every(60000, cx => this.refreshMachines(cx));
     // `git status` walks the whole tree, on another machine a process there:
     // only when its answer could have changed (see `due`).
     cx.timer.every(250, (cx) => this.checkNew(cx));
   }
 
   checkNew(cx) {
+    // In the background nothing is drawn; coming back, due() still sees what changed against its last look.
+    if (!window().active) return;
     const now = Date.now();
     const sp = spaces();
     for (const s of sp) if (!this.shown.has(s.id)) this.born[s.id] ??= now;
@@ -231,7 +233,7 @@ export default class Spaces extends View {
     try {
       // No optional locks: a status that touched the index would wake the watch again.
       // Writes nothing under .git (index lock, fsmonitor cookie): watch() would wake on it.
-      const r = await exec("git", ["--no-optional-locks", "-c", "core.fsmonitor=false", "status", "--porcelain=v2", "--branch"], { cwd, on });
+      const r = await exec("git", ["--no-optional-locks", "-c", "core.fsmonitor=false", "status", "--porcelain=v2", "--branch", "--untracked-files=no"], { cwd, on });
       if (r.code !== 0) {
         // Only git's own "no" is remembered as no repo; anything else is asked again.
         if (!/not a git repository/i.test(r.stderr)) this.unsure.add(key);
@@ -267,7 +269,9 @@ export default class Spaces extends View {
     cx.spawn(async (cx) => {
       try {
         while (this.watching.has(repo)) {
-          await watchFolder(repo);
+          const paths = await watchFolder(repo);
+          // Only HEAD and refs move a branch or its ahead/behind; agents' index and object writes don't.
+          if (paths?.length && !paths.some((p) => p === repo || /(^|\/)(HEAD|packed-refs)$|(^|\/)refs\//.test(p))) continue;
           const mine = JSON.stringify([null, repo]);
           if (this.watching.has(repo)) this.refreshGit(Object.keys(this.git).filter((k) => this.git[k]?.repo === mine), cx);
         }

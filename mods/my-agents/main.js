@@ -216,11 +216,12 @@ export default class Agents extends View {
     }, cx);
   }
 
-  // The branch's PR from the work badge's poll (your open PRs and last week's merged ones).
+  // The branch's PR from the work badge's poll (your open PRs and last week's merged ones), in this folder's repo
+  // (a folder named like it): two repos can share a branch name.
   // shortcut: PRs you didn't open get no link; ask gh per branch if that matters.
-  pr(branch) {
-    const all = shared("work.prs");
-    return [...(all?.open ?? []), ...(all?.merged ?? [])].find((p) => p.branch === branch) ?? null;
+  pr(branch, cwd) {
+    const all = shared("work.prs"), parts = cwd.split("/");
+    return [...(all?.open ?? []), ...(all?.merged ?? [])].find((p) => p.branch === branch && parts.includes(p.repo)) ?? null;
   }
 
   // "repo · branch" in the main checkout, "repo ⎇ branch" in a worktree, "folder/" outside a repo,
@@ -235,7 +236,7 @@ export default class Agents extends View {
       ? (short ? `${repo.name} ${repo.linked ? "⎇" : "·"} ${short}` : repo.name)
       : repo === null ? (p.cwd === home() ? "~" : `${base(p.cwd)}/`) : "";
     const issue = issueKey(branch);
-    const pr = branch && !MAIN_BRANCHES.has(branch) ? this.pr(branch) : null;
+    const pr = branch && !MAIN_BRANCHES.has(branch) ? this.pr(branch, p.cwd) : null;
     const link = (id, label, url, tip, open = (u) => exec("open", [u]), color = t.muted) => div().id(id).flex_none().px(4).rounded(4).text_color(color)
       .cursor_pointer().hover((s) => s.bg(t.hover).text_color(t.foreground)).tooltip(tip)
       .on_click((_e, cx) => { cx.stop_propagation(); open(url); })

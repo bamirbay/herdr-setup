@@ -40,7 +40,7 @@ export class RepoView {
     this.loading = true;
     cx.spawn(async (cx) => {
       try {
-        const r = await changedFiles({ cwd: t.cwd, on: t.on, branchMode: mode() === "branch", prBase: prFor(t.branch)?.base });
+        const r = await changedFiles({ cwd: t.cwd, on: t.on, branchMode: mode() === "branch", prBase: prFor(t)?.base });
         if (key() !== context) return;
         this.switchedAt = null;
         if (!r.root) { this.root = null; this.files = []; this.error = "Not a git repository"; this.reset(); return; }

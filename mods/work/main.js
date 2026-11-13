@@ -43,7 +43,9 @@ async function fetchPRs() {
   const since = new Date(Date.now() - 7 * 86400000).toISOString().slice(0, 10);
   const r = await exec("gh", ["api", "graphql", "-f", `query=${PR_QUERY}`, "-f", "open=is:pr is:open author:@me archived:false", "-f", `merged=is:pr is:merged author:@me merged:>=${since}`]);
   if (r.code !== 0) throw new Error((r.stderr || r.stdout).trim());
-  const d = JSON.parse(r.stdout).data;
+  // gh exits 0 on GraphQL errors: none of the data is an error, some of it (e.g. an org the token can't see) a warning.
+  const j = JSON.parse(r.stdout), d = j.data;
+  if (!d) throw new Error(j.errors?.[0]?.message ?? "GitHub returned no data");
   const pr = (n) => {
     const threads = n.reviewThreads.nodes.filter((t) => !t.isResolved).map((t) => t.id);
     const p = {
@@ -53,7 +55,8 @@ async function fetchPRs() {
     };
     return { ...p, ...prBadge(p) };
   };
-  return { at: Date.now(), open: d.open.nodes.filter((n) => n.number).map(pr), merged: d.merged.nodes.filter((n) => n.number).map(pr) };
+  const list = (s) => (s?.nodes ?? []).filter((n) => n?.number).map(pr);
+  return { at: Date.now(), open: list(d.open), merged: list(d.merged), warning: j.errors?.[0]?.message ?? null };
 }
 
 // What every view shows for a PR: "#12 ✓ approved". tone "bad" (CI failed, changes requested) is red, "good" (approved) green.
@@ -94,8 +97,11 @@ async function refreshPRs(withAlerts) {
     const d = await fetchPRs();
     if (withAlerts) {
       const prev = shared("work.snap");
-      // A click shows the PR pane (never hides it: my-tabs' showprs).
-      if (prev) for (const a of alerts(prev, d)) notify({ title: `#${a.p.number} ${a.p.title}`.slice(0, 90), body: `${a.body} · ${a.p.repo}`, level: a.level, action: { name: "my-tabs.showprs" } });
+      // A click shows the PR pane (never hides it: my-tabs' showprs). More than 2 at once (after a sleep, a review
+      // wave) become one toast.
+      const list = prev ? alerts(prev, d) : [], action = { name: "my-tabs.showprs" };
+      if (list.length > 2) notify({ title: `${list.length} PR updates`, body: list.map((a) => `#${a.p.number} ${a.body}`).join(" · ").slice(0, 300), level: list.some((a) => a.level === "error") ? "error" : "info", action });
+      else for (const a of list) notify({ title: `#${a.p.number} ${a.p.title}`.slice(0, 90), body: `${a.body} · ${a.p.repo}`, level: a.level, action });
       setShared("work.snap", snapshot(d));
     }
     setShared("work.prs", d);
@@ -163,13 +169,16 @@ async function openLinear(url) {
 
 // ---- Sessions
 
-// The terminal pane on a matching branch (agents first), with its tab and space.
+// The terminal pane that matches (agents first), with its tab and space.
 function sessionWhere(match) {
-  const p = panes().filter((x) => x.terminal && x.branch && match(x.branch)).sort((a, b) => Boolean(b.status) - Boolean(a.status))[0];
+  const p = panes().filter((x) => x.terminal && x.branch && match(x)).sort((a, b) => Boolean(b.status) - Boolean(a.status))[0];
   if (!p) return null;
   for (const s of spaces()) { const tab = s.tabs.find((t) => t.id === p.tab); if (tab) return { pane: p, tab, space: s }; }
   return null;
 }
+// A PR's branch in a folder of its repo (named like it, as clones and <repo>/.worktrees/* are): two repos can share a branch name.
+const isPR = (p, branch, cwd) => p.branch === branch && (cwd ?? "").split("/").includes(p.repo);
+if (!isPR({ branch: "b", repo: "r" }, "b", "/x/r/.worktrees/b") || isPR({ branch: "b", repo: "r" }, "b", "/x/other/.worktrees/b")) throw new Error("isPR self-check failed");
 function goTo(s) { run("space.select", { id: s.space.id }); run("tab.select", { id: s.tab.id }); run("pane.focus", { pane: s.pane.pane }); }
 // The name the agents list shows: the tab's own name, else the program's live title (Claude's session title).
 const sessionName = (s) => {
@@ -203,7 +212,9 @@ async function sendComments(p, s) {
     const [o, n] = p.owner.split("/");
     const r = await exec("gh", ["api", "graphql", "-f", `query=${THREADS_QUERY}`, "-f", `o=${o}`, "-f", `n=${n}`, "-F", `num=${p.number}`]);
     if (r.code !== 0) throw new Error((r.stderr || r.stdout).trim());
-    const open = JSON.parse(r.stdout).data.repository.pullRequest.reviewThreads.nodes.filter((t) => !t.isResolved);
+    const j = JSON.parse(r.stdout), got = j.data?.repository?.pullRequest;
+    if (!got) throw new Error(j.errors?.[0]?.message ?? "GitHub returned no PR");
+    const open = got.reviewThreads.nodes.filter((t) => !t.isResolved);
     const before = new Set((shared("work.sent") ?? {})[p.url] ?? []), fresh = open.filter((t) => !before.has(t.id));
     if (!fresh.length) { notify({ title: `#${p.number}: nothing new to send`, body: `All ${open.length} unresolved comments were already sent.`, level: "info" }); return; }
     // A blocked agent refuses it (hc send without --force).
@@ -222,9 +233,10 @@ async function sendComments(p, s) {
 
 const inDir = (dir) => panes().filter((x) => x.cwd === dir || x.cwd?.startsWith(`${dir}/`));
 
-// What the confirmation shows, or a reason to refuse: an agent still busy there, uncommitted changes, local commits
-// the merged PR doesn't have, or a tab to close that is its space's last (spaces close by hand).
+// What the confirmation shows, or a reason to refuse: a PR not merged, an agent still busy there, uncommitted changes,
+// local commits the merged PR doesn't have, or a tab to close that is its space's last (spaces close by hand).
 async function cleanupPlan(p, dir) {
+  if (p.state !== "MERGED") throw new Error("Only a merged PR's worktree can be cleaned up");
   const repo = `${REPOS()}/${p.repo}`, git = (args, cwd = dir) => exec("git", ["-C", cwd, ...args], { timeout: 120000 });
   if (inDir(dir).some((x) => x.status === "working" || x.status === "blocked")) throw new Error("An agent in it is still working or waiting for you");
   const status = await git(["status", "--porcelain", "--ignored"]);
@@ -242,8 +254,11 @@ async function cleanupPlan(p, dir) {
   return { repo, dir, tabIds, ignored: lines.map((l) => l.slice(3)) };
 }
 
-async function cleanup(p, plan) {
+async function cleanup(p, confirmed) {
   try {
+    // Checked again: minutes can pass between the question and the click (an agent restarted there, a new tab).
+    const plan = await cleanupPlan(p, confirmed.dir);
+    if (plan.tabIds.join() !== confirmed.tabIds.join()) throw new Error("Its tabs changed since you asked: press Clean up… again");
     for (const id of plan.tabIds) run("tab.close", { id, confirmed: true });
     // No --force: git still refuses if anything but ignored files changed since the plan (ignored files go, as listed).
     const rm = await exec("git", ["-C", plan.repo, "worktree", "remove", plan.dir], { timeout: 120000 });
@@ -348,7 +363,7 @@ export default class Work extends View {
   }
 
   prRow(t, p, merged) {
-    const s = sessionWhere((b) => b === p.branch), dir = merged ? this.trees[p.repo]?.[p.branch] : null;
+    const s = sessionWhere((x) => isPR(p, x.branch, x.cwd)), dir = merged ? this.trees[p.repo]?.[p.branch] : null;
     const review = p.review === "APPROVED" ? ["approved", C.green] : p.review === "CHANGES_REQUESTED" ? ["changes requested", C.red] : null;
     // Comments go only to an agent: pasted into a plain shell, every line would run as a command.
     const agent = s?.pane.status ? s : null;
@@ -395,7 +410,7 @@ export default class Work extends View {
     if (f?.cwd) this.focus = { cwd: f.cwd, branch: panes().find((p) => p.pane === f.pane)?.branch ?? null };
     const repo = this.focus ? this.repoOf(this.focus.cwd, cx) : null, branch = this.focus?.branch;
     const inRepo = (p) => !repo || p.owner.toLowerCase() === repo.toLowerCase();
-    const mine = branch && !/^(main|master)$/.test(branch) ? [...(data?.open ?? []), ...(data?.merged ?? [])].find((p) => p.branch === branch) ?? null : null;
+    const mine = branch && !/^(main|master)$/.test(branch) ? [...(data?.open ?? []), ...(data?.merged ?? [])].find((p) => isPR(p, branch, this.focus.cwd)) ?? null : null;
     // Needing you first: CI failed, changes requested, comments not sent yet; then the most recently updated.
     const need = (p) => (FAILED.has(p.ci) ? 4 : 0) + (p.review === "CHANGES_REQUESTED" ? 2 : 0) + (unsent(p) > 0 ? 1 : 0);
     const open = (data?.open ?? []).filter((p) => inRepo(p) && p !== mine).sort((a, b) => need(b) - need(a) || (b.updated ?? "").localeCompare(a.updated ?? ""));
@@ -406,7 +421,7 @@ export default class Work extends View {
     ] : [];
     return root
       .child(this.header(t, repo ? `PRs · ${repo.split("/").pop()}` : "Pull requests", data, () => refreshPRs(false), "prs"))
-      .when(Boolean(data?.error), (e) => e.child(div().px(12).py(6).text_size(11).text_color(C.red).child(data.error)))
+      .when(Boolean(data?.error || data?.warning), (e) => e.child(div().px(12).py(6).text_size(11).text_color(C.red).child(data.error ?? `Some PRs may be missing: ${data.warning}`)))
       .child(this.list("work-prs", [
         ...(!data ? [div().p(8).text_color(t.dim).child("Loading…")] : []),
         ...here,
@@ -420,7 +435,7 @@ export default class Work extends View {
   // ---- Linear pane
 
   issueRow(t, i) {
-    const s = sessionWhere((b) => issueKey(b) === i.identifier), started = i.state.type === "started";
+    const s = sessionWhere((x) => issueKey(x.branch) === i.identifier), started = i.state.type === "started";
     return v_flex().id(`is-${i.identifier}`).flex_none().px(8).py(6).gap(3).rounded(7).cursor_pointer().hover((e) => e.bg(t.hover))
       .on_click(() => { openLinear(i.url); })
       .child(h_flex().gap(6).items_center().min_w(0)
@@ -469,7 +484,7 @@ export default class Work extends View {
         .when(failing > 0, (e) => e.child(div().text_color(C.red).child(`✗ ${failing}`)))
         .when(changes > 0, (e) => e.child(div().text_color(C.red).child(`${changes} changes`)))
         .when(comments > 0, (e) => e.child(div().text_color(C.amber).child(`${comments} with new comments`)))
-        .when(Boolean(prs?.error), (e) => e.child(div().text_color(C.red).child("!"))))
+        .when(Boolean(prs?.error || prs?.warning), (e) => e.child(div().text_color(C.red).child("!"))))
       .child(part("badge-linear", () => run("my-tabs.linear")).tooltip("Linear (⌘⇧L)")
         .child(div().child(iss?.nokey ? "Linear: add a key" : iss ? `${visibleIssues(iss).issues.length} issues` : "Linear …"))
         .when(Boolean(iss?.error), (e) => e.child(div().text_color(C.red).child("!"))));

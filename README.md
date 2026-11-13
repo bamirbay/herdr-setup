@@ -51,7 +51,7 @@ Or tell your Claude: "add the Herdr setup from this repo".
 | `cmd-left` / `right` / `up` / `down` | Move to the pane in that direction |
 | `cmd-r` / `cmd-shift-r` | Rename tab / space |
 | `cmd-t`, `cmd-shift-t` | New tab, new Claude tab |
-| `cmd-w`, `cmd-shift-w` | Close the pane. On a sub-agent, it goes back under its parent and keeps running. Never closes a space's last pane |
+| `cmd-w`, `cmd-shift-w` | Close the pane. A terminal's pane asks first (Enter closes, Esc cancels). On a sub-agent, it goes back under its parent and keeps running. Never closes a space's last pane |
 | `cmd-k` | Clear the terminal |
 | `cmd-l` | Open the space's Linear project, or link one |
 | `cmd-shift-g` | Review tab for the focused terminal |
