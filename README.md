@@ -26,7 +26,7 @@ A Herdr window for working with coding agents:
    Merge `keys.json` into yours: add its keys and sections, and don't overwrite keys you already use.
    Then run `herdr-app do layout.switch --name my-main`.
 2. Change the settings to yours:
-   - `mods/work/main.js` top: `REPOS_DIR` and `BRANCH_PREFIX`.
+   - `mods/work/main.js` top: `REPOS_DIR`.
    - `mods/my-agents/main.js` and `mods/my-pane/main.js`: `LINEAR`, the Linear workspace URL.
 3. Linear: create a personal API key (Linear → Settings → Security & access).
    Run `security add-generic-password -s herdr-linear -a linear -w` and paste the key.

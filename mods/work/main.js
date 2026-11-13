@@ -1,16 +1,14 @@
 // Work: your GitHub PRs and Linear issues, each tied to the session working on it. One mod, by props:
 // - view "badge" (status bar, always on screen): polls GitHub every 2 min and Linear every 5, posts PR alerts,
 //   and handles cmd-shift-i / cmd-shift-l (work.prs / work.linear) by showing or hiding that pane;
-// - view "prs" / "linear" (right panel stack children): the lists, from what the badge stores;
-// - pick (dialog): the repo a Linear team's issues start in.
-// Shared: work.prs, work.issues, work.snap (last PR states, for alerts), work.repos (team key -> repo folder).
+// - view "prs" / "linear" (right panel stack children): the lists, from what the badge stores.
+// Shared: work.prs, work.issues, work.snap (last PR states, for alerts), work.sent (review threads sent to sessions).
 import { View, div } from "gpui-kit";
 import { v_flex, h_flex } from "gpui-base";
-import { panes, spaces, focused, run, exec, hc, home, theme, shared, setShared, notify, nextCommand, props, openOverlay, closeOverlay, layout } from "herdr";
+import { panes, spaces, focused, run, exec, hc, home, theme, shared, setShared, notify, nextCommand, props, layout } from "herdr";
 
 // Settings: change to yours.
-const REPOS_DIR = "Developer/repos"; // under your home: where your git clones live, named like their GitHub repos
-const BRANCH_PREFIX = "bekzat/"; // Start's new branches: <prefix><issue-key>-<first title words>
+const REPOS_DIR = "Developer/repos"; // under your home: where your git clones live (Clean up finds merged PRs' worktrees there)
 
 const C = { green: "#3fb950", red: "#f85149", amber: "#d29922", blue: "#388bfd" };
 const REPOS = () => `${home()}/${REPOS_DIR}`;
@@ -170,55 +168,12 @@ async function worktrees(repo) {
   return out;
 }
 
-// A Claude tab on `branch`: in its worktree when one exists (any branch with the same issue key counts), resuming the
-// folder's last conversation; else a new worktree first, from origin/main for a new branch or origin's copy of a PR's.
-// shortcut: `claude -c` with no earlier conversation there exits; start `claude` by hand then.
-async function openSession({ repo, branch, fresh, key, task, space, name }) {
-  try {
-    const trees = await worktrees(repo);
-    const hit = trees[branch] ? branch : key ? Object.keys(trees).find((b) => issueKey(b) === key && trees[b] !== repo) : null;
-    if (hit) { run("tab.new", { space, name, folder: trees[hit], argv: ["claude", "-c"] }); return; }
-    const dir = `${repo}/.worktrees/${branch.replace(/^[^/]+\//, "").replace(/\//g, "-")}`;
-    const steps = fresh ? [["fetch", "origin", "main"], ["worktree", "add", "-b", branch, dir, "origin/main"]] : [["fetch", "origin", branch], ["worktree", "add", dir, branch]];
-    for (const args of steps) {
-      const r = await exec("git", ["-C", repo, ...args], { timeout: 120000 });
-      if (r.code !== 0) throw new Error((r.stderr || r.stdout).trim());
-    }
-    run("tab.new", { space, name, folder: dir, argv: ["claude"], ...(task ? { task } : {}) });
-  } catch (e) {
-    notify({ title: `Couldn't open ${branch}`, body: String(e.message ?? e).slice(0, 300), level: "error" });
-  }
-}
-
 const slug = (url) => /\/project\/([^/?#]+)/.exec(url ?? "")?.[1] ?? null;
-// The space linked to that Linear project (cmd-l's links), else the current one.
-function spaceFor(projectUrl) {
-  const want = slug(projectUrl);
-  const hit = want && Object.entries(shared("linear.projects") ?? {}).find(([id, u]) => slug(u) === want && spaces().some((s) => s.id === id));
-  return hit ? hit[0] : activeSpace();
-}
-
 // In a space linked to a Linear project (cmd-l's link), only that project's issues; elsewhere all of yours.
 function visibleIssues(data) {
   const want = slug((shared("linear.projects") ?? {})[activeSpace()]), all = data?.issues ?? [];
   return { want, issues: want ? all.filter((i) => slug(i.project?.url) === want) : all };
 }
-
-function startIssue(issue) {
-  const repo = (shared("work.repos") ?? {})[issue.team.key];
-  if (!repo) { pickRepo(issue.team.key, issue); return; }
-  const words = issue.title.toLowerCase().replace(/[^a-z0-9]+/g, " ").trim().split(" ").slice(0, 4).join("-");
-  openSession({
-    repo, fresh: true, key: issue.identifier, branch: `${BRANCH_PREFIX}${issue.identifier.toLowerCase()}${words ? `-${words}` : ""}`,
-    task: `Work on ${issue.identifier}: ${issue.title}\n${issue.url}`, space: spaceFor(issue.project?.url), name: `${issue.identifier} ${issue.title}`.slice(0, 40),
-  });
-}
-
-function pickRepo(team, issue = null) {
-  openOverlay({ mod: "work", kind: "dialog", width: 420, height: 440, props: { pick: { team, issue } } });
-}
-
-const openPR = (p) => openSession({ repo: `${REPOS()}/${p.repo}`, branch: p.branch, fresh: false, space: activeSpace(), name: `#${p.number} ${p.title}`.slice(0, 40) });
 
 async function sendComments(p, s) {
   try {
@@ -282,15 +237,6 @@ export default class Work extends View {
   init(_props, cx) {
     this.view = props()?.view ?? null;
     this.trees = {}; this.busy = {};
-    if (props()?.pick) {
-      this.repoList = null;
-      cx.spawn(async (cx) => {
-        const r = await exec("sh", ["-c", 'for d in "$1"/*/; do [ -e "$d.git" ] && printf "%s\\n" "${d%/}"; done', "sh", REPOS()]).catch(() => null);
-        this.repoList = (r?.stdout ?? "").split("\n").filter(Boolean);
-        cx.notify();
-      });
-      return;
-    }
     if (this.view !== "badge") return;
     cx.spawn(async () => { await refreshPRs(true); await refreshIssues(); });
     cx.timer.every(120000, () => { refreshPRs(true); });
@@ -306,7 +252,6 @@ export default class Work extends View {
 
   render(cx) {
     const t = theme();
-    if (props()?.pick) return this.renderPick(t);
     if (this.view === "badge") return this.renderBadge(t);
     const root = v_flex().id(`work-${this.view}`).size_full().min_h(0).rounded(10).overflow_hidden().bg(t.background).border_1().border_color(t.border).text_color(t.foreground).text_size(13);
     return this.view === "linear" ? this.renderLinear(root, t, cx) : this.renderPRs(root, t, cx);
@@ -377,7 +322,6 @@ export default class Work extends View {
             ? this.chip(t, `send-${p.url}`, `Send ${unsent(p)} new comment${unsent(p) === 1 ? "" : "s"}`, C.amber, () => sendComments(p, s))
             : this.chip(t, `sent-${p.url}`, `✓ ${p.unresolved} sent`, C.green)))
         .when(Boolean(s), (e) => e.child(this.chip(t, `go-${p.url}`, `→ ${sessionName(s)}`.slice(0, 28), t.foreground, () => goTo(s))))
-        .when(!s && !merged, (e) => e.child(this.chip(t, `open-${p.url}`, "Open", null, () => openPR(p))))
         .when(Boolean(dir), (e) => e.child(this.chip(t, `clean-${p.url}`, "Clean up", null, () => cleanup(p, dir)))));
   }
 
@@ -438,19 +382,17 @@ export default class Work extends View {
         .child(div().flex_1().min_w(0).truncate().child(i.title)))
       .child(h_flex().pl(20).gap(5).items_center().text_size(11).text_color(t.dim)
         .child(div().flex_1().min_w(0).truncate().child(i.state.name))
-        .when(Boolean(s), (e) => e.child(this.chip(t, `go-${i.identifier}`, `→ ${sessionName(s)}`.slice(0, 28), t.foreground, () => goTo(s))))
-        .when(!s, (e) => e.child(this.chip(t, `start-${i.identifier}`, "Start", null, () => startIssue(i)))));
+        .when(Boolean(s), (e) => e.child(this.chip(t, `go-${i.identifier}`, `→ ${sessionName(s)}`.slice(0, 28), t.foreground, () => goTo(s)))));
   }
 
   renderLinear(root, t) {
-    const data = shared("work.issues"), repos = shared("work.repos") ?? {}, { want, issues } = visibleIssues(data);
+    const data = shared("work.issues"), { want, issues } = visibleIssues(data);
     const groups = new Map();
     for (const i of issues) {
       const k = i.project?.name ?? "No project";
       groups.set(k, [...(groups.get(k) ?? []), i]);
     }
     const ordered = [...groups.entries()].sort(([a], [b]) => (a === "No project") - (b === "No project") || a.localeCompare(b));
-    const teams = [...new Set(issues.map((i) => i.team.key))].sort();
     const title = want ? `Linear · ${issues[0]?.project?.name ?? spaces().find((s) => s.active)?.name ?? "this project"}` : "Linear";
     const noKey = v_flex().p(10).gap(8).text_size(12).text_color(t.muted)
       .child(div().child("Add a Linear API key: in Linear, Settings → Security & access → Personal API keys → New key. Then run this in a terminal and paste the key:"))
@@ -463,29 +405,7 @@ export default class Work extends View {
         ...(!data ? [div().p(8).text_color(t.dim).child("Loading…")] : []),
         ...(data && !data.nokey && !issues.length ? [div().p(8).text_color(t.dim).child(want ? "None of your open issues are in this project." : "No open issues assigned to you.")] : []),
         ...ordered.flatMap(([name, list]) => [this.section(t, `${name} · ${list.length}`), ...[...list].sort((a, b) => (b.state.type === "started") - (a.state.type === "started")).map((i) => this.issueRow(t, i))]),
-      ]))
-      .when(teams.length > 0, (e) => e.child(v_flex().flex_none().px(14).py(8).gap(3).border_t(1).border_color(t.border).text_size(11).text_color(t.dim)
-        .children(teams.map((k) => h_flex().gap(6).items_center()
-          .child(div().child(`${k} starts in ${repos[k] ? repos[k].split("/").pop() : "—"}`))
-          .child(this.chip(t, `repo-${k}`, repos[k] ? "change" : "pick", null, () => pickRepo(k)))))));
-  }
-
-  // ---- Repo dialog
-
-  renderPick(t) {
-    const { team, issue } = props().pick;
-    return v_flex().size_full().bg(t.popover ?? t.background).text_color(t.foreground).text_size(13).p(14).gap(8)
-      .child(div().font_semibold().child(`Repo for ${team} issues`))
-      .child(div().text_size(11).text_color(t.dim).child(issue ? `Remembered for the next ${team} issue. Starting ${issue.identifier} after this.` : "Remembered for every issue of this team."))
-      .child(div().flex_1().min_h(0).child(v_flex().id("pick-list").size_full().overflow_y_scrollbar().gap(1)
-        .when(!this.repoList, (e) => e.child(div().text_color(t.dim).child("Loading…")))
-        .children((this.repoList ?? []).map((dir) => div().id(`pick-${dir}`).flex_none().px(8).py(5).rounded(6).cursor_pointer().hover((e) => e.bg(t.hover))
-          .on_click(() => {
-            setShared("work.repos", { ...(shared("work.repos") ?? {}), [team]: dir });
-            closeOverlay(props().overlay);
-            if (issue) startIssue(issue);
-          })
-          .child(dir.split("/").pop())))));
+      ]));
   }
 
   // ---- Status bar badge
