@@ -63,6 +63,8 @@
     "cmd-shift-b": "layout.toggle:panel",
     "cmd-left": "pane.go:left",
     "cmd-right": "pane.go:right",
+    "cmd-up": "pane.go:up",
+    "cmd-down": "pane.go:down",
     "cmd-shift-down": "space.next",
     "cmd-shift-up": "space.prev",
     "cmd-shift-g": "mod.open:review",
