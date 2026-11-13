@@ -1,11 +1,13 @@
 // Work: your GitHub PRs and Linear issues, each tied to the session working on it. One mod, by props:
-// - view "badge" (status bar, always on screen): polls GitHub every 2 min and Linear every 5, posts PR alerts,
-//   and handles cmd-shift-i / cmd-shift-l (work.prs / work.linear) by showing or hiding that pane;
+// - view "badge" (status bar, always on screen): polls GitHub every 2 min and Linear every 5 and posts PR alerts;
+//   it is the one source of PR facts: other mods read work.prs (label, tone, base) and work.needsYou;
 // - view "prs" / "linear" (right panel stack children): the lists, from what the badge stores.
-// Shared: work.prs, work.issues, work.snap (last PR states, for alerts), work.sent (review threads sent to sessions).
+// The tab bar (my-tabs) owns showing and hiding the panes.
+// Shared: work.prs, work.issues, work.snap (last PR states, for alerts), work.sent (review threads sent to sessions),
+// work.needsYou (any open PR needs you).
 import { View, div } from "gpui-kit";
 import { v_flex, h_flex } from "gpui-base";
-import { panes, spaces, focused, run, exec, hc, home, theme, shared, setShared, notify, nextCommand, props, layout } from "herdr";
+import { panes, spaces, focused, run, exec, hc, home, theme, shared, setShared, notify, props } from "herdr";
 
 // Settings: change to yours.
 const REPOS_DIR = "Developer/repos"; // under your home: where your git clones live (Clean up finds merged PRs' worktrees there)
@@ -42,14 +44,27 @@ async function fetchPRs() {
   const r = await exec("gh", ["api", "graphql", "-f", `query=${PR_QUERY}`, "-f", "open=is:pr is:open author:@me archived:false", "-f", `merged=is:pr is:merged author:@me merged:>=${since}`]);
   if (r.code !== 0) throw new Error((r.stderr || r.stdout).trim());
   const d = JSON.parse(r.stdout).data;
-  const pr = (n) => ({
-    number: n.number, title: n.title, url: n.url, draft: n.isDraft, state: n.state, branch: n.headRefName, head: n.headRefOid,
-    repo: n.repository.name, owner: n.repository.nameWithOwner, review: n.reviewDecision, updated: n.updatedAt, merged: n.mergedAt,
-    ci: n.commits?.nodes?.[0]?.commit?.statusCheckRollup?.state ?? null,
-    threads: n.reviewThreads.nodes.filter((t) => !t.isResolved).map((t) => t.id), unresolved: n.reviewThreads.nodes.filter((t) => !t.isResolved).length,
-  });
+  const pr = (n) => {
+    const threads = n.reviewThreads.nodes.filter((t) => !t.isResolved).map((t) => t.id);
+    const p = {
+      number: n.number, title: n.title, url: n.url, draft: n.isDraft, state: n.state, branch: n.headRefName, head: n.headRefOid, base: n.baseRefName,
+      repo: n.repository.name, owner: n.repository.nameWithOwner, review: n.reviewDecision, updated: n.updatedAt, merged: n.mergedAt,
+      ci: n.commits?.nodes?.[0]?.commit?.statusCheckRollup?.state ?? null, threads, unresolved: threads.length,
+    };
+    return { ...p, ...prBadge(p) };
+  };
   return { at: Date.now(), open: d.open.nodes.filter((n) => n.number).map(pr), merged: d.merged.nodes.filter((n) => n.number).map(pr) };
 }
+
+// What every view shows for a PR: "#12 ✓ approved". tone "bad" (CI failed, changes requested) is red, "good" (approved) green.
+export function prBadge(p) {
+  if (p.state !== "OPEN") return { label: `#${p.number} ${p.state.toLowerCase()}`, tone: null };
+  const ci = !p.ci ? "" : p.ci === "SUCCESS" ? " ✓" : FAILED.has(p.ci) ? " ✗" : " •";
+  const review = p.review === "APPROVED" ? " approved" : p.review === "CHANGES_REQUESTED" ? " changes requested" : "";
+  return { label: `#${p.number}${ci}${review}`, tone: FAILED.has(p.ci) || p.review === "CHANGES_REQUESTED" ? "bad" : p.review === "APPROVED" ? "good" : null };
+}
+if (prBadge({ number: 1, state: "OPEN", ci: "FAILURE", review: "APPROVED" }).label !== "#1 ✗ approved" || prBadge({ number: 1, state: "OPEN", ci: "FAILURE" }).tone !== "bad"
+  || prBadge({ number: 2, state: "MERGED" }).label !== "#2 merged" || prBadge({ number: 3, state: "OPEN", review: "APPROVED" }).tone !== "good") throw new Error("prBadge self-check failed");
 
 // What changed since the last poll that deserves a notification. A PR seen for the first time alerts nothing.
 export function alerts(prev, next) {
@@ -79,13 +94,15 @@ async function refreshPRs(withAlerts) {
     const d = await fetchPRs();
     if (withAlerts) {
       const prev = shared("work.snap");
-      if (prev) for (const a of alerts(prev, d)) notify({ title: `#${a.p.number} ${a.p.title}`.slice(0, 90), body: `${a.body} · ${a.p.repo}`, level: a.level, action: { name: "work.prs" } });
+      // A click shows the PR pane (never hides it: my-tabs' showprs).
+      if (prev) for (const a of alerts(prev, d)) notify({ title: `#${a.p.number} ${a.p.title}`.slice(0, 90), body: `${a.body} · ${a.p.repo}`, level: a.level, action: { name: "my-tabs.showprs" } });
       setShared("work.snap", snapshot(d));
     }
     setShared("work.prs", d);
     // Sent threads of PRs no longer open are forgotten.
     const sent = shared("work.sent") ?? {}, keep = Object.fromEntries(d.open.filter((p) => sent[p.url]).map((p) => [p.url, sent[p.url]]));
     if (Object.keys(keep).length !== Object.keys(sent).length) setShared("work.sent", keep);
+    publishNeeds();
   } catch (e) {
     setShared("work.prs", { open: [], merged: [], ...(shared("work.prs") ?? {}), error: String(e.message ?? e).slice(0, 300) });
   }
@@ -97,6 +114,12 @@ const unsent = (p) => {
   const sent = new Set((shared("work.sent") ?? {})[p.url] ?? []);
   return p.threads.filter((id) => !sent.has(id)).length;
 };
+const needsYou = (p) => FAILED.has(p.ci) || p.review === "CHANGES_REQUESTED" || unsent(p) > 0;
+// work.needsYou: the tab bar's red dot. Written whenever PRs or sent threads change.
+function publishNeeds() {
+  const v = (shared("work.prs")?.open ?? []).some(needsYou);
+  if (shared("work.needsYou") !== v) setShared("work.needsYou", v);
+}
 
 const THREADS_QUERY = `query($o: String!, $n: String!, $num: Int!) { repository(owner: $o, name: $n) { pullRequest(number: $num) {
   reviewThreads(first: 100) { nodes { id isResolved path line originalLine comments(first: 20) { nodes { author { login } body } } } } } } }`;
@@ -187,6 +210,7 @@ async function sendComments(p, s) {
     const sent = await hc(["send", s.pane.terminal, threadsMessage(p, fresh)]);
     if (sent.code !== 0) throw new Error((sent.stderr || sent.stdout).trim());
     setShared("work.sent", { ...(shared("work.sent") ?? {}), [p.url]: open.map((t) => t.id) });
+    publishNeeds();
     notify({ title: `Sent ${fresh.length} comment${fresh.length === 1 ? "" : "s"} from #${p.number}`, body: `To ${sessionName(s)}`, level: "info" });
     goTo(s);
   } catch (e) {
@@ -194,25 +218,44 @@ async function sendComments(p, s) {
   }
 }
 
-// After a merge: closes the tabs working in the worktree, removes it and deletes the branch. Refuses on uncommitted
-// changes, on local commits the merged PR doesn't have, and when a tab to close is its space's last (spaces close by hand).
-async function cleanup(p, dir) {
+// ---- Clean up after a merge: check, ask in the PR's row, then close the worktree's tabs, remove it, delete the branch.
+
+const inDir = (dir) => panes().filter((x) => x.cwd === dir || x.cwd?.startsWith(`${dir}/`));
+
+// What the confirmation shows, or a reason to refuse: an agent still busy there, uncommitted changes, local commits
+// the merged PR doesn't have, or a tab to close that is its space's last (spaces close by hand).
+async function cleanupPlan(p, dir) {
   const repo = `${REPOS()}/${p.repo}`, git = (args, cwd = dir) => exec("git", ["-C", cwd, ...args], { timeout: 120000 });
+  if (inDir(dir).some((x) => x.status === "working" || x.status === "blocked")) throw new Error("An agent in it is still working or waiting for you");
+  const status = await git(["status", "--porcelain", "--ignored"]);
+  if (status.code !== 0) throw new Error((status.stderr || status.stdout).trim());
+  const lines = status.stdout.split("\n").filter(Boolean);
+  if (lines.some((l) => !l.startsWith("!! "))) throw new Error(`Uncommitted changes in ${dir.replace(home(), "~")}`);
+  await git(["fetch", "origin", `pull/${p.number}/head`], repo);
+  const tip = (await git(["rev-parse", "HEAD"])).stdout.trim();
+  if (tip !== p.head && (await git(["merge-base", "--is-ancestor", "HEAD", p.head])).code !== 0) throw new Error("The local branch has commits the merged PR doesn't have");
+  const tabIds = [...new Set(inDir(dir).map((x) => x.tab))];
+  for (const s of spaces()) {
+    const mine = s.tabs.filter((t) => tabIds.includes(t.id));
+    if (mine.length && mine.length >= s.tabs.length) throw new Error(`Its session is the last tab in "${s.name}": close that by hand first`);
+  }
+  return { repo, dir, tabIds, ignored: lines.map((l) => l.slice(3)) };
+}
+
+async function cleanup(p, plan) {
   try {
-    if ((await git(["status", "--porcelain"])).stdout.trim()) throw new Error(`Uncommitted changes in ${dir}`);
-    await git(["fetch", "origin", `pull/${p.number}/head`], repo);
-    const tip = (await git(["rev-parse", "HEAD"])).stdout.trim();
-    if (tip !== p.head && (await git(["merge-base", "--is-ancestor", "HEAD", p.head])).code !== 0) throw new Error("The local branch has commits the merged PR doesn't have");
-    const tabIds = [...new Set(panes().filter((x) => x.cwd === dir || x.cwd?.startsWith(`${dir}/`)).map((x) => x.tab))];
-    for (const s of spaces()) {
-      const mine = s.tabs.filter((t) => tabIds.includes(t.id));
-      if (mine.length && mine.length >= s.tabs.length) throw new Error(`Its session is the last tab in "${s.name}": close that by hand first`);
-    }
-    for (const id of tabIds) run("tab.close", { id, confirmed: true });
-    const rm = await git(["worktree", "remove", dir], repo);
+    for (const id of plan.tabIds) run("tab.close", { id, confirmed: true });
+    // No --force: git still refuses if anything but ignored files changed since the plan (ignored files go, as listed).
+    const rm = await exec("git", ["-C", plan.repo, "worktree", "remove", plan.dir], { timeout: 120000 });
     if (rm.code !== 0) throw new Error((rm.stderr || rm.stdout).trim());
-    await git(["branch", "-D", p.branch], repo);
-    notify({ title: `Cleaned up #${p.number}`, body: `Removed ${dir.replace(home(), "~")} and ${p.branch}`, level: "info" });
+    await exec("git", ["-C", plan.repo, "branch", "-D", p.branch]);
+    // The review mod's comments and Viewed marks for that worktree go too (its key for a local repo root).
+    const ck = `comments:${JSON.stringify([null, plan.dir])}`;
+    for (const key of ["review.comments", "review.viewed"]) {
+      const all = { ...(shared(key) ?? {}) };
+      if (ck in all) { delete all[ck]; setShared(key, all); }
+    }
+    notify({ title: `Cleaned up #${p.number}`, body: `Removed ${plan.dir.replace(home(), "~")} and ${p.branch}`, level: "info" });
   } catch (e) {
     notify({ title: `Didn't clean up #${p.number}`, body: String(e.message ?? e).slice(0, 300), level: "warning" });
   }
@@ -220,34 +263,14 @@ async function cleanup(p, dir) {
 
 // ---- Panes
 
-function find(node, id) {
-  if (node?.id === id) return node;
-  for (const child of node?.children ?? []) { const f = find(child, id); if (f) return f; }
-  return null;
-}
-// cmd-shift-i / cmd-shift-l: show that pane in the right panel; again (while it shows): hide the panel.
-function togglePane(view) {
-  const panel = find(layout(), "panel"), stack = find(layout(), "panel-body");
-  if (panel && !panel.hidden && stack?.active === view) { run("layout.hide", { id: "panel" }); return; }
-  run("layout.select", { stack: "panel-body", child: view });
-  run("layout.show", { id: "panel" });
-}
-
 export default class Work extends View {
   init(_props, cx) {
     this.view = props()?.view ?? null;
-    this.trees = {}; this.busy = {};
+    this.trees = {}; this.busy = {}; this.confirm = null;
     if (this.view !== "badge") return;
     cx.spawn(async () => { await refreshPRs(true); await refreshIssues(); });
     cx.timer.every(120000, () => { refreshPRs(true); });
     cx.timer.every(300000, () => { refreshIssues(); });
-    cx.spawn(async (cx) => {
-      for (;;) {
-        const command = (await nextCommand()).split(/[.:]/).pop();
-        if (command === "prs" || command === "linear") togglePane(command);
-        cx.notify();
-      }
-    });
   }
 
   render(cx) {
@@ -303,9 +326,32 @@ export default class Work extends View {
     });
   }
 
+  // Clean up's first click: check, then ask in the row (what goes, including ignored files), or say why not.
+  askCleanup(p, dir, cx) {
+    cx.spawn(async (cx) => {
+      try { this.confirm = { url: p.url, plan: await cleanupPlan(p, dir) }; }
+      catch (e) { notify({ title: `Can't clean up #${p.number}`, body: String(e.message ?? e).slice(0, 300), level: "warning" }); }
+      cx.notify();
+    });
+  }
+
+  confirmStrip(t, p) {
+    const { plan } = this.confirm, shown = plan.ignored.slice(0, 4).join(", ");
+    const more = plan.ignored.length > 4 ? ` and ${plan.ignored.length - 4} more` : "";
+    return v_flex().mt(4).ml(20).p(8).gap(6).rounded(6).border_1().border_color(C.red).text_size(11).text_color(t.muted)
+      .on_click((_e, cx) => cx.stop_propagation())
+      .child(div().child(`Removes ${plan.dir.replace(home(), "~")} and branch ${p.branch}${plan.tabIds.length ? `, closes ${plan.tabIds.length} tab${plan.tabIds.length === 1 ? "" : "s"}` : ""}.`))
+      .when(plan.ignored.length > 0, (e) => e.child(div().child(`Also deletes ignored files: ${shown}${more}.`)))
+      .child(h_flex().gap(6)
+        .child(this.chip(t, `clean-yes-${p.url}`, "Clean up", C.red, () => { this.confirm = null; cleanup(p, plan); }))
+        .child(this.chip(t, `clean-no-${p.url}`, "Cancel", null, (cx) => { this.confirm = null; cx.notify(); })));
+  }
+
   prRow(t, p, merged) {
     const s = sessionWhere((b) => b === p.branch), dir = merged ? this.trees[p.repo]?.[p.branch] : null;
     const review = p.review === "APPROVED" ? ["approved", C.green] : p.review === "CHANGES_REQUESTED" ? ["changes requested", C.red] : null;
+    // Comments go only to an agent: pasted into a plain shell, every line would run as a command.
+    const agent = s?.pane.status ? s : null;
     return v_flex().id(`pr-${p.url}`).flex_none().px(8).py(6).gap(3).rounded(7).cursor_pointer().hover((e) => e.bg(t.hover))
       .on_click(() => { exec("open", [p.url]).catch(() => null); })
       .child(h_flex().gap(6).items_center().min_w(0)
@@ -316,13 +362,14 @@ export default class Work extends View {
         .child(div().flex_1().min_w(0).truncate().child(`${p.repo} · ${p.branch.replace(/^[^/]+\//, "")}`))
         .when(p.draft, (e) => e.child(this.chip(t, `draft-${p.url}`, "draft")))
         .when(Boolean(review) && !merged, (e) => e.child(this.chip(t, `rv-${p.url}`, review[0], review[1])))
-        .when(p.unresolved > 0 && !merged, (e) => e.child(!s
+        .when(p.unresolved > 0 && !merged, (e) => e.child(!agent
           ? this.chip(t, `un-${p.url}`, `${p.unresolved} unresolved`, C.amber)
           : unsent(p) > 0
-            ? this.chip(t, `send-${p.url}`, `Send ${unsent(p)} new comment${unsent(p) === 1 ? "" : "s"}`, C.amber, () => sendComments(p, s))
+            ? this.chip(t, `send-${p.url}`, `Send ${unsent(p)} new comment${unsent(p) === 1 ? "" : "s"}`, C.amber, () => sendComments(p, agent))
             : this.chip(t, `sent-${p.url}`, `✓ ${p.unresolved} sent`, C.green)))
         .when(Boolean(s), (e) => e.child(this.chip(t, `go-${p.url}`, `→ ${sessionName(s)}`.slice(0, 28), t.foreground, () => goTo(s))))
-        .when(Boolean(dir), (e) => e.child(this.chip(t, `clean-${p.url}`, "Clean up", null, () => cleanup(p, dir)))));
+        .when(Boolean(dir) && this.confirm?.url !== p.url, (e) => e.child(this.chip(t, `clean-${p.url}`, "Clean up…", null, (cx) => this.askCleanup(p, dir, cx)))))
+      .when(this.confirm?.url === p.url, (e) => e.child(this.confirmStrip(t, p)));
   }
 
   // A folder's GitHub repo ("owner/name") from its origin remote; null outside a repo. Looked up once per folder.
@@ -416,13 +463,13 @@ export default class Work extends View {
     const comments = open.filter((p) => unsent(p) > 0).length;
     const part = (id, onClick) => h_flex().id(id).gap(6).items_center().cursor_pointer().hover((s) => s.text_color(t.foreground)).on_click(onClick);
     return h_flex().size_full().px(10).gap(14).items_center().justify_end().text_size(11).text_color(t.dim)
-      .child(part("badge-prs", () => togglePane("prs")).tooltip("Pull requests (⌘⇧I)")
+      .child(part("badge-prs", () => run("my-tabs.prs")).tooltip("Pull requests (⌘⇧I)")
         .child(div().child(prs ? `${open.length} PRs` : "PRs …"))
         .when(failing > 0, (e) => e.child(div().text_color(C.red).child(`✗ ${failing}`)))
         .when(changes > 0, (e) => e.child(div().text_color(C.red).child(`${changes} changes`)))
         .when(comments > 0, (e) => e.child(div().text_color(C.amber).child(`${comments} with new comments`)))
         .when(Boolean(prs?.error), (e) => e.child(div().text_color(C.red).child("!"))))
-      .child(part("badge-linear", () => togglePane("linear")).tooltip("Linear (⌘⇧L)")
+      .child(part("badge-linear", () => run("my-tabs.linear")).tooltip("Linear (⌘⇧L)")
         .child(div().child(iss?.nokey ? "Linear: add a key" : iss ? `${visibleIssues(iss).issues.length} issues` : "Linear …"))
         .when(Boolean(iss?.error), (e) => e.child(div().text_color(C.red).child("!"))));
   }

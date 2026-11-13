@@ -34,6 +34,12 @@ function find(node, id) {
   return null;
 }
 
+// The right panel's panes (files, changes, prs, linear): the buttons, cmd-shift-i / cmd-shift-l and the work badge
+// toggle one (again while it shows: hide the panel); a PR alert's click only shows the PR pane.
+const showing = (id) => { const root = layout(); return !find(root, "panel")?.hidden && find(root, "panel-body")?.active === id; };
+function showPanel(id) { run("layout.select", { stack: "panel-body", child: id }); run("layout.show", { id: "panel" }); }
+function togglePanel(id) { if (showing(id)) run("layout.hide", { id: "panel" }); else showPanel(id); }
+
 export default class Tabs extends View {
   init(_props, cx) {
     this.pressed = null;
@@ -43,6 +49,8 @@ export default class Tabs extends View {
         try {
           if (command === "close") closePane();
           if (command === "beside") beside();
+          if (command === "prs" || command === "linear") togglePanel(command);
+          if (command === "showprs") showPanel("prs");
         } catch (e) {
           notify({ title: `${command} failed`, body: String(e?.message ?? e).slice(0, 300), level: "error" });
         }
@@ -104,7 +112,8 @@ export default class Tabs extends View {
         .child(div().max_w(170).truncate().child(c.zoomed ? `${name} Z` : name))
         .when(c.status === "working", el => el.child(svg("mods/workspace-chrome/spinner.svg").size(12).flex_none().text_color(t.working).spin(900)))
         .when(c.status === "blocked" || c.status === "done", el => el.child(div().size(6).rounded(3).bg(t[c.status])))
-        .when(c.active, el => el.child(div().id(`close-${c.id}`).text_color(t.dim).on_mouse_down("left", stop).on_click((_e, cx) => { cx.stop_propagation(); run("tab.close", { id: c.id }); }).child(svg("mods/pane/close.svg").size(12))));
+        // No ✕ on a space's only tab: closing it would close the space, and spaces close by hand.
+        .when(c.active && shown.length > 1, el => el.child(div().id(`close-${c.id}`).text_color(t.dim).on_mouse_down("left", stop).on_click((_e, cx) => { cx.stop_propagation(); run("tab.close", { id: c.id }); }).child(svg("mods/pane/close.svg").size(12))));
     };
     const root = layout(), sidebar = find(root, "sidebar"), w = window();
     // Old saved rails and a dragged-narrow sidebar can be smaller than the window buttons.
@@ -115,21 +124,16 @@ export default class Tabs extends View {
     // PRs and Linear (the work mod's panes) are always on.
     const enabled = [...(shared("workspace.panels") ?? ["files", "changes"]), "prs", "linear"];
     this.syncPanel(space, panel, body, enabled);
-    // A PR needs you: CI failed, changes requested, or review comments not yet sent to its session (work.sent).
-    const sent = shared("work.sent") ?? {};
-    const needsYou = (shared("work.prs")?.open ?? []).some((p) => p.ci === "FAILURE" || p.ci === "ERROR" || p.review === "CHANGES_REQUESTED"
-      || (p.threads ? p.threads.some((id) => !(sent[p.url] ?? []).includes(id)) : p.unresolved > 0));
     const panelButton = (id, label, icon, dot = false) => {
       const on = panel && !panel.hidden && body?.active === id;
       return h_flex().id(`panel-${id}`).h(26).px(8).gap(5).flex_none().items_center().rounded(6)
         .text_size(12).bg(on ? t.selected : t.chrome).text_color(on ? t.foreground : t.muted)
         .hover(s => s.bg(t.hover)).on_mouse_down("left", stop)
-        .on_click(() => {
-          if (on) run("layout.hide", { id: "panel" });
-          else { run("layout.select", { stack: "panel-body", child: id }); run("layout.show", { id: "panel" }); }
-        }).child(svg(icon).size(14)).child(label)
+        .on_click(() => togglePanel(id)).child(svg(icon).size(14)).child(label)
         .when(dot, el => el.child(div().size(6).rounded(3).bg("#f85149")));
     };
+    // The red dot: some open PR needs you (the work badge decides and stores it).
+    const needsYou = shared("work.needsYou") === true;
     return h_flex().size_full().min_w(0).px(10).pl(lightsPadding).gap(3).items_center().bg(t.chrome).border_b(1).border_color(t.border)
       .on_mouse_up("left", () => { this.pressed = null; })
       .on_scroll_wheel(e => { if (Math.abs(e.delta.y) >= 1) run(e.delta.y > 0 ? "tab.prev" : "tab.next"); })

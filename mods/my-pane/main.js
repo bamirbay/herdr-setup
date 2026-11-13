@@ -3,12 +3,12 @@
 // Shows the program's icon (the app's program table), the agent's name or
 // the terminal's title, the folder, and the agent's status; buttons split, zoom and close
 // this pane. Props from the app: { pane, terminal }. Click: focus the pane.
-// Mine: after the name, the branch's Linear issue and PR (from the work mod's poll: CI ✓ ✗ •, review), each a link.
-// Close parks a sub-agent and never closes a space's last pane, like cmd-w.
+// Mine: after the name, the branch's Linear issue and PR (the work badge's label and tone), each a link.
+// Close is cmd-w on this pane (my-tabs.close): it parks a sub-agent and never closes a space's last pane.
 
 import { View, div, svg, image } from "gpui-kit";
 import { h_flex } from "gpui-base";
-import { panes, spaces, terminals, props, run, exec, theme, home, shared } from "herdr";
+import { panes, props, run, exec, theme, home, shared } from "herdr";
 
 const LINEAR = "https://linear.app/tryprofound/issue/"; // setting: your Linear workspace
 const issueKey = (branch) => /^([a-z]+-\d+)(?:-|$)/i.exec((branch ?? "").replace(/^[^/]+\//, ""))?.[1]?.toUpperCase() ?? null;
@@ -81,7 +81,9 @@ export default class Pane extends View {
         .child(this.button(t, `ph-r-${pane}`, "split-right", "pane.split", { direction: "right", pane }))
         .child(this.button(t, `ph-d-${pane}`, "split-down", "pane.split", { direction: "down", pane }))
         .child(this.button(t, `ph-z-${pane}`, p.zoomed ? "unzoom" : "zoom", "pane.zoom", { pane }))
-        .when(this.closable(p), el => el.child(this.closeButton(t, p))));
+        .child(div().id(`ph-x-${pane}`).p(3).rounded(4).text_color(t.dim).hover((s) => s.bg(t.hover).text_color(t.foreground))
+          .on_click((_e, cx) => { cx.stop_propagation(); run("pane.focus", { pane }); run("my-tabs.close"); })
+          .child(svg("mods/my-pane/close.svg").size(14))));
   }
 
   // The branch's issue key and PR, each opening on click.
@@ -93,25 +95,8 @@ export default class Pane extends View {
       .on_click((_e, cx) => { cx.stop_propagation(); open(); }).child(label);
     const out = [];
     if (key) out.push(link(`ph-issue-${p.pane}`, key, t.muted, () => openLinear((shared("work.issues")?.issues ?? []).find((i) => i.identifier === key)?.url ?? LINEAR + key)));
-    if (pr) {
-      const failed = pr.ci === "FAILURE" || pr.ci === "ERROR", open = pr.state === "OPEN";
-      const ci = !open || !pr.ci ? "" : pr.ci === "SUCCESS" ? " ✓" : failed ? " ✗" : " •";
-      const label = open ? `#${pr.number}${ci}${pr.review === "APPROVED" ? " approved" : pr.review === "CHANGES_REQUESTED" ? " changes requested" : ""}` : `#${pr.number} ${pr.state.toLowerCase()}`;
-      const color = open && (failed || pr.review === "CHANGES_REQUESTED") ? "#f85149" : open && pr.review === "APPROVED" ? "#3fb950" : t.muted;
-      out.push(link(`ph-pr-${p.pane}`, label, color, () => { exec("open", [pr.url]).catch(() => null); }));
-    }
+    const tone = { bad: "#f85149", good: "#3fb950" };
+    if (pr) out.push(link(`ph-pr-${p.pane}`, pr.label ?? `#${pr.number}`, tone[pr.tone] ?? t.muted, () => { exec("open", [pr.url]).catch(() => null); }));
     return out;
-  }
-
-  // Not the space's last pane, unless it's a sub-agent (that one goes back under its parent).
-  closable(p) {
-    if (terminals().find((k) => k.address === p.terminal)?.parent) return true;
-    const space = spaces().find((s) => s.tabs.some((x) => x.id === p.tab)), tabs = new Set((space?.tabs ?? []).map((x) => x.id));
-    return panes().filter((x) => tabs.has(x.tab)).length > 1;
-  }
-
-  closeButton(t, p) {
-    const sub = terminals().find((k) => k.address === p.terminal && k.state === "live")?.parent;
-    return sub ? this.button(t, `ph-x-${p.pane}`, "close", "terminal.park", { terminal: p.terminal }) : this.button(t, `ph-x-${p.pane}`, "close", "pane.close", { pane: p.pane });
   }
 }

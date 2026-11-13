@@ -241,14 +241,12 @@ export default class Agents extends View {
       .on_click((_e, cx) => { cx.stop_propagation(); open(url); })
       .child(label);
     if (!text && !issue && !pr) return null;
-    const failed = pr?.ci === "FAILURE" || pr?.ci === "ERROR", ci = !pr?.ci || pr.state !== "OPEN" ? "" : pr.ci === "SUCCESS" ? " ✓" : failed ? " ✗" : " •";
-    const prLabel = pr && (pr.state !== "OPEN" ? `#${pr.number} ${pr.state.toLowerCase()}`
-      : `#${pr.number}${ci}${pr.review === "APPROVED" ? " approved" : pr.review === "CHANGES_REQUESTED" ? " changes" : ""}`);
-    const prColor = pr && pr.state === "OPEN" ? (failed || pr.review === "CHANGES_REQUESTED" ? "#f85149" : pr.review === "APPROVED" ? "#3fb950" : t.muted) : t.muted;
+    // Label and tone come from the work badge ("#12 ✓ approved"; "bad" red, "good" green).
+    const prColor = { bad: "#f85149", good: "#3fb950" }[pr?.tone] ?? t.muted;
     return h_flex().min_w(0).gap(4).items_center().text_size(11).text_color(t.dim)
       .child(div().flex_1().min_w(0).truncate().child(text))
       .when(Boolean(issue), (el) => el.child(link(`issue-${a.address}`, issue, LINEAR + issue, "Open Linear issue", openLinear)))
-      .when(Boolean(pr), (el) => el.child(link(`pr-${a.address}`, prLabel, pr.url, "Open PR", undefined, prColor)));
+      .when(Boolean(pr), (el) => el.child(link(`pr-${a.address}`, pr.label ?? `#${pr.number}`, pr.url, "Open PR", undefined, prColor)));
   }
 
   // Live sub-agents of `addr`, depth first, each with the tree lines in front of it.
@@ -288,8 +286,9 @@ export default class Agents extends View {
       .when(Boolean(pic), el => el.child(div().mr(8).child(pic)))
       .child(div().flex_1().truncate().text_color(on ? t.foreground : t.muted).child(k.name || k.template || k.program?.name || k.address))
       .when(this.hoveredSub === k.address && !this.listed.has(k.address), (el) => el.child(div().id(`beside-${k.address}`).flex_none().mr(6).px(5).rounded(4)
-        .text_size(11).text_color(t.muted).cursor_pointer().hover((s) => s.bg(t.raised).text_color(t.foreground)).tooltip("Open beside the focused pane (⌘⇧S)")
-        .on_click((_e, cx) => { cx.stop_propagation(); run("terminal.keep", { terminal: k.address, place: "right" }); })
+        .text_size(11).text_color(t.muted).cursor_pointer().hover((s) => s.bg(t.raised).text_color(t.foreground)).tooltip("Open beside its parent")
+        // Beside its parent: focus the parent's pane first, or it would land beside whatever has focus, maybe in another space.
+        .on_click((_e, cx) => { cx.stop_propagation(); if (panes().some((p) => p.terminal === k.parent)) run("pane.focus", { terminal: k.parent }); run("terminal.keep", { terminal: k.address, place: "right" }); })
         .child("⇥ beside")))
       .child(this.status(t, { status: st }, compact));
   }
