@@ -1,5 +1,5 @@
 // Review's shared state, and the terminal a review is about.
-// Shared keys: review.mode, review.open (terminal -> {path, at}: the file to jump to), review.tabs (terminal -> its
+// Shared keys: review.mode ("branch" | "uncommitted" | "sent"), review.open (terminal -> {path, at}: the file to jump to), review.tabs (terminal -> its
 // review tab's name), review.comments / review.viewed (repo key -> comments / path -> diff fingerprint).
 // PR facts (the base branch) come from the work badge's work.prs.
 import { spaces, panes, focused, terminals, props, run, notify, shared, setShared, layout } from "herdr";

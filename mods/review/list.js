@@ -1,5 +1,5 @@
 // The right sidebar: the focused terminal's changed files (a review tab's terminal while one is focused), the
-// Branch / Uncommitted switch, and commit. Clicking a file opens that terminal's review tab at the file.
+// Branch / Uncommitted / Since sent switch, and commit. Clicking a file opens that terminal's review tab at the file.
 import { div } from "gpui-kit";
 import { h_flex, v_flex, InputState, Input, Scrollbar } from "gpui-base";
 import { exec, shared, setShared, theme } from "herdr";
@@ -54,11 +54,11 @@ export class ReviewList extends RepoView {
       .when(mode() === id, (e) => e.bg(t.selected).text_color(t.foreground))
       .when(mode() !== id, (e) => e.text_color(t.dim).hover((s) => s.text_color(t.foreground)))
       .on_click(() => setShared("review.mode", id)).child(label);
-    const empty = this.error || (this.loading ? "Loading changes…" : this.root ? (mode() === "branch" ? "No changes on this branch" : "No uncommitted changes") : "No folder");
+    const empty = this.error || (this.loading ? "Loading changes…" : this.root ? ({ branch: "No changes on this branch", uncommitted: "No uncommitted changes", sent: "No changes since your last send" }[mode()]) : "No folder");
     return this.notes(this.frame(t, cx)
       .child(h_flex().h(42).flex_none().px(14).gap(8).items_center().border_b(1).border_color(t.border)
         .child(div().font_semibold().child("Review"))
-        .child(h_flex().gap(2).child(modeButton("branch", "Branch")).child(modeButton("uncommitted", "Uncommitted")))
+        .child(h_flex().gap(2).child(modeButton("branch", "Branch")).child(modeButton("uncommitted", "Uncommitted")).child(modeButton("sent", "Since sent").tooltip("Only what changed after your last Send")))
         .child(div().flex_1())
         .child(div().text_size(11).text_color(C.green).child(`+${add}`)).child(div().text_size(11).text_color(C.red).child(`−${del}`)))
       .when(Boolean(this.baseNote), (e) => e.child(div().px(12).py(4).text_size(11).text_color(t.dim).child(this.baseNote)))

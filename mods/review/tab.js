@@ -7,7 +7,7 @@ import { div } from "gpui-kit";
 import { h_flex, v_flex, TextareaState, Textarea } from "gpui-base";
 import { panes, exec, hc, run, settings, shared, theme } from "herdr";
 import { mode, tied, target, key, prFor, viewedOf, setViewed, commentsOf, setComments, onScreen } from "./state.js";
-import { C, STATUS, anchor, message, loadDiffs } from "./git.js";
+import { C, STATUS, anchor, message, loadDiffs, saveSent } from "./git.js";
 import { RepoView } from "./repo.js";
 
 const ROW = 20, HEAD = 36, LINE = 18, OVERSCAN = 4;
@@ -69,7 +69,7 @@ export class ReviewTab extends RepoView {
   paused() { return Boolean(this.editing || this.preview); }
 
   async afterFiles(context) {
-    const d = await loadDiffs({ root: this.root, on: this.on, files: this.files, hasHead: this.hasHead, against: this.against }, this.sig);
+    const d = await loadDiffs({ root: this.root, on: this.on, files: this.files, hasHead: this.hasHead, against: this.against, index: this.index }, this.sig);
     if (!d || key() !== context) return;
     const selKeys = this.sel && [this.rows[this.sel.a], this.rows[this.sel.b]].map((r) => r && rowKey(r));
     Object.assign(this, { sig: d.sig, rows: d.rows, auto: d.auto, cut: d.cut, rowsVer: (this.rowsVer ?? 0) + 1 });
@@ -311,27 +311,29 @@ export class ReviewTab extends RepoView {
   }
 
   // Every comment on this repo in one message to the tab's agent, then back to that agent.
-  // A blocked agent refuses it (hc send without --force).
+  // A blocked agent refuses it (hc send without --force). The worktree is saved first, for Since sent; a failed send
+  // still moves that point (the next send saves it again).
   send(cx) {
     const list = this.comments();
     if (!list.length || this.busy) return;
     const pane = panes().find((p) => p.terminal === tied());
     if (!pane?.status) { this.preview = null; this.say("note", `${tied()} isn't running an agent`); cx.notify(); return; }
-    const ck = this.commentsKey;
+    const ck = this.commentsKey, root = this.root, on = this.on;
     this.busy = "send"; this.note = null; this.done = null;
     cx.spawn(async (cx) => {
       try {
+        const saved = await saveSent(root, on).then(() => "", (e) => ` · Since sent not saved: ${e.message ?? e}`);
         const r = await hc(["send", pane.terminal, message(list)]);
         if (r.code !== 0) throw new Error((r.stderr || r.stdout).trim());
         // Only the comments that went: one saved meanwhile stays.
         const went = new Set(list.map((c) => JSON.stringify(c)));
         setComments(ck, commentsOf(ck).filter((c) => !went.has(JSON.stringify(c))));
         this.preview = null;
-        this.say("done", `Sent ${list.length} comment${list.length === 1 ? "" : "s"} to ${pane.program?.name ?? pane.terminal}`);
+        this.say("done", `Sent ${list.length} comment${list.length === 1 ? "" : "s"} to ${pane.program?.name ?? pane.terminal}${saved}`);
         run("tab.select", { id: pane.tab });
         run("pane.focus", { pane: pane.pane });
       } catch (e) { this.say("note", `Send failed: ${e.message ?? e}`); }
-      finally { this.busy = false; cx.notify(); }
+      finally { this.busy = false; this.stale = true; cx.notify(); } // Since sent starts over from here
     });
     cx.notify();
   }
@@ -475,7 +477,7 @@ export class ReviewTab extends RepoView {
         .when(Boolean(this.only), (e) => e.child(chip("only", "one file · o for all", t.foreground, (_e, cx) => this.toggleOnly(cx))))
         .when(add > 0, (e) => e.child(div().text_size(11).text_color(C.green).child(`+${add}`)))
         .when(del > 0, (e) => e.child(div().text_size(11).text_color(C.red).child(`−${del}`)))
-        .child(div().text_size(10.5).text_color(t.dim).child(mode() === "branch" ? `vs ${this.baseName ?? "origin/main"}` : "uncommitted"))
+        .child(div().text_size(10.5).text_color(t.dim).child(mode() === "branch" ? `vs ${this.baseName ?? "origin/main"}` : mode() === "sent" ? "since your last send" : "uncommitted"))
         .when(Boolean(pr), (e) => e.child(chip("pr", pr.label ?? `#${pr.number}`, TONE[pr.tone] ?? t.muted, () => { exec("open", [pr.url]).catch(() => null); })))
         .child(div().flex_1())
         .child(chip("keys", "? keys", null, (_e, cx) => { this.help = !this.help; cx.notify(); }))

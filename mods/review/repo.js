@@ -40,12 +40,13 @@ export class RepoView {
     this.loading = true;
     cx.spawn(async (cx) => {
       try {
-        const r = await changedFiles({ cwd: t.cwd, on: t.on, branchMode: mode() === "branch", prBase: prFor(t)?.base });
+        const r = await changedFiles({ cwd: t.cwd, on: t.on, branchMode: mode() === "branch", sinceSent: mode() === "sent", prBase: prFor(t)?.base });
         if (key() !== context) return;
         this.switchedAt = null;
         if (!r.root) { this.root = null; this.files = []; this.error = "Not a git repository"; this.reset(); return; }
-        Object.assign(this, { root: r.root, on: t.on, files: r.files, hasHead: r.hasHead, against: r.against, baseName: r.baseName, limited: r.limited, error: null });
-        this.baseNote = mode() === "branch" && r.hasHead && !r.base ? "No base branch to compare with: showing uncommitted changes" : null;
+        Object.assign(this, { root: r.root, on: t.on, files: r.files, hasHead: r.hasHead, against: r.against, index: r.index, baseName: r.baseName, limited: r.limited, error: null });
+        this.baseNote = r.nothingSent ? "No comments sent from here yet: after a send, this shows only what changed since"
+          : mode() === "branch" && r.hasHead && !r.base ? "No base branch to compare with: showing uncommitted changes" : null;
         this.commentsKey = `comments:${JSON.stringify([t.on, r.root])}`;
         this.watch(r.root, cx);
         await this.afterFiles(context);

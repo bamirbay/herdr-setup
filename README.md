@@ -13,7 +13,7 @@ A Herdr window for working with coding agents:
 | `layouts/my-main.json` | The window: the stock `main` layout, plus the panes and the status bar badge below |
 | `mods/my-spaces` | Spaces list. A space can link to a Linear project; `cmd-l` opens it in the Linear app |
 | `mods/my-agents` | Agents list. Each row shows its repo, branch, Linear issue and PR (with CI and review state). Sub-agents can open beside the focused pane |
-| `mods/review` | The right sidebar lists changed files. The review tab shows every file's diff in one scroll, with line comments sent to the agent |
+| `mods/review` | The right sidebar lists changed files: the branch's, the uncommitted ones, or only what changed since your last Send. The review tab shows every file's diff in one scroll, with line comments sent to the agent |
 | `mods/work` | The PR pane, the Linear pane and the status bar badge. The badge polls GitHub and Linear and posts PR alerts |
 | `mods/my-tabs` | The tab bar, with **PRs** (a red dot when a PR needs you), **Linear** and **Changes** buttons on the right. It also handles `cmd-w` and `cmd-shift-s`, because it is always on screen |
 | `mods/my-pane` | Each pane's header. After the name it shows the branch's Linear issue and PR. Its close button follows the `cmd-w` rules |
@@ -38,6 +38,8 @@ A Herdr window for working with coding agents:
    - If your tools come from mise, add `eval "$(mise activate zsh --shims)"` to `~/.zprofile`.
      Without it, Claude hooks fail with `node: command not found` in agents started by `hc`.
      It takes effect after `hc server stop && hc server start`, which ends running agents.
+   - The `cmd-j` switcher is [herdr-recall](https://github.com/shihyuho/herdr-recall) (third-party, not in this repo; read at 92dbdd3).
+     Clone it and run its `./install.sh`, then press `cmd-j` once to start it.
 
 Or tell your Claude: "add the Herdr setup from this repo".
 
@@ -57,6 +59,7 @@ Or tell your Claude: "add the Herdr setup from this repo".
 | `cmd-shift-g` | Review tab for the focused terminal |
 | `cmd-shift-i` / `cmd-shift-l` | PR pane / Linear pane (again: hide) |
 | `cmd-shift-s` | Open the focused agent's newest sub-agent to the right |
+| `cmd-j` | Recent switcher (herdr-recall): spaces, tabs, panes and agents, most recent first; `cmd-j` `enter` goes back |
 
 The review tab takes the keyboard when it opens (or after any click in it). Its keys, while no comment is being written
 (`?` shows them in the tab):
@@ -78,5 +81,7 @@ The review tab takes the keyboard when it opens (or after any click in it). Its 
 - `gh`: your PRs, review threads and PR links. `gh` must be logged in.
 - `curl`: Linear's API, with the key read from Keychain.
 - `hc send`: comments to agents.
+- `git add -A` into a copy of the index on each review Send (for Since sent). It is saved as `herdr-review-sent.index`
+  in the worktree's git folder, and removing the worktree removes it.
 
 Nothing runs on a timer except two polls, from the badge only: GitHub every 2 minutes and Linear every 5.

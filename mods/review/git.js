@@ -71,13 +71,65 @@ if (anchor("a.py", [{ kind: "+", number: 4 }, { kind: "+", number: 6 }]) !== "a.
     !== JSON.stringify({ "x y": ["--- a/x y", "+++ b/x y", "@@ -1 +1 @@", "-a", "+b"], z: ["@@ -0,0 +1 @@", "+c"] })
   || fingerprint(["ab", "c"]) === fingerprint(["a", "bc"])) throw new Error("review self-check failed");
 
+// git at root, read-only; with `index`, against that index file instead of the repo's own (Since sent).
+const gitAt = (root, on, index) => (args) => index
+  ? exec("env", [`GIT_INDEX_FILE=${index}`, "git", ...READ, ...args], { cwd: root, on })
+  : exec("git", [...READ, ...args], { cwd: root, on });
+
+// "path -> {add, del, binary}" from `--numstat -z` results, summed.
+function numstats(results) {
+  const stats = {};
+  for (const result of results) {
+    if (result.code !== 0) throw new Error(result.stderr);
+    for (const entry of result.stdout.split("\0")) {
+      const [a, d, ...parts] = entry.split("\t");
+      if (!parts.length) continue;
+      const path = parts.join("\t"), old = stats[path] ?? { add: 0, del: 0 };
+      stats[path] = { add: old.add + (Number(a) || 0), del: old.del + (Number(d) || 0), binary: a === "-" };
+    }
+  }
+  return stats;
+}
+// Files from `--name-status -z` output (status and path alternate).
+function nameStatus(stdout, stats) {
+  const parts = stdout.split("\0"), out = [];
+  for (let i = 0; i + 1 < parts.length && out.length < MAX_FILES; i += 2) {
+    if (parts[i + 1]) out.push({ path: parts[i + 1], status: letter(parts[i]), fresh: false, ...(stats[parts[i + 1]] ?? { add: 0, del: 0 }) });
+  }
+  return out;
+}
+
+// Since sent: on each send the review saves the worktree as it was (`git add -A` into a copy of the index, untracked
+// files included) to this file in the worktree's git folder, so removing the worktree removes it too.
+const SENT = "herdr-review-sent.index";
+export async function saveSent(root, on) {
+  const r = await exec("sh", ["-c", `f=$(git rev-parse --path-format=absolute --git-path ${SENT}) && i=$(git rev-parse --path-format=absolute --git-path index) || exit 1
+rm -f "$f.new"; cp "$i" "$f.new" 2>/dev/null
+GIT_INDEX_FILE="$f.new" git -c core.fsmonitor=false add -A && mv -f "$f.new" "$f"`], { cwd: root, on });
+  if (r.code !== 0) throw new Error((r.stderr || r.stdout).trim() || "git add failed");
+}
+
+// What changed since the last send: the worktree against the saved index, and files that weren't there then.
+async function sentFiles(root, on, hasHead) {
+  const index = (await gitAt(root, on)(["rev-parse", "--path-format=absolute", "--git-path", SENT])).stdout.trim();
+  if ((await exec("test", ["-f", index], { on })).code !== 0) return { root, files: [], hasHead, nothingSent: true };
+  const git = gitAt(root, on, index);
+  const [names, stat, others] = await Promise.all([git(["diff", "--name-status", "-z", "--no-renames"]), git(["diff", "--numstat", "-z", "--no-renames"]),
+    git(["ls-files", "--others", "--exclude-standard", "-z"])]);
+  for (const r of [names, others]) if (r.code !== 0) throw new Error(r.stderr);
+  const added = others.stdout.split("\0").filter(Boolean);
+  const files = [...nameStatus(names.stdout, numstats([stat])), ...added.slice(0, MAX_FILES).map((path) => ({ path, status: "A", fresh: true, add: 0, del: 0 }))];
+  return { root, files, hasHead, index, limited: added.length > MAX_FILES };
+}
+
 // The changed files at cwd. Branch mode: everything since this branch left its PR's base branch (stacked PRs), else
-// origin's default; uncommitted mode, or no base found: against HEAD. Untracked files are always in.
-// Returns { root: null } outside a repo.
-export async function changedFiles({ cwd, on, branchMode, prBase }) {
+// origin's default; uncommitted mode, or no base found: against HEAD; since-sent mode: see sentFiles. Untracked files
+// are always in. Returns { root: null } outside a repo.
+export async function changedFiles({ cwd, on, branchMode, sinceSent, prBase }) {
   const top = await exec("git", ["rev-parse", "--show-toplevel"], { cwd, on });
   if (top.code !== 0) return { root: null };
-  const root = top.stdout.trim(), git = (args) => exec("git", [...READ, ...args], { cwd: root, on });
+  const root = top.stdout.trim(), git = gitAt(root, on);
+  if (sinceSent) return sentFiles(root, on, (await git(["rev-parse", "--verify", "HEAD"])).code === 0);
   const status = await git(["status", "--porcelain=v1", "-z", "--no-renames", "--untracked-files=all"]);
   if (status.code !== 0) throw new Error(status.stderr);
   const hasHead = (await git(["rev-parse", "--verify", "HEAD"])).code === 0;
@@ -89,17 +141,7 @@ export async function changedFiles({ cwd, on, branchMode, prBase }) {
     }
   }
   const against = base ?? "HEAD";
-  const stats = {};
-  const numstats = hasHead ? [await git(["diff", against, "--numstat", "-z", "--no-renames"])] : [await git(["diff", "--cached", "--numstat", "-z", "--no-renames"]), await git(["diff", "--numstat", "-z", "--no-renames"])];
-  for (const result of numstats) {
-    if (result.code !== 0) throw new Error(result.stderr);
-    for (const entry of result.stdout.split("\0")) {
-      const [a, d, ...parts] = entry.split("\t");
-      if (!parts.length) continue;
-      const path = parts.join("\t"), old = stats[path] ?? { add: 0, del: 0 };
-      stats[path] = { add: old.add + (Number(a) || 0), del: old.del + (Number(d) || 0), binary: a === "-" };
-    }
-  }
+  const stats = numstats(hasHead ? [await git(["diff", against, "--numstat", "-z", "--no-renames"])] : [await git(["diff", "--cached", "--numstat", "-z", "--no-renames"]), await git(["diff", "--numstat", "-z", "--no-renames"])]);
   const files = [], entries = status.stdout.split("\0").filter(Boolean);
   for (const entry of entries.slice(0, MAX_FILES)) {
     const xy = entry.slice(0, 2), path = entry.slice(3), fresh = xy === "??";
@@ -111,21 +153,18 @@ export async function changedFiles({ cwd, on, branchMode, prBase }) {
   if (base) {
     const names = await git(["diff", base, "--name-status", "-z", "--no-renames"]);
     if (names.code !== 0) throw new Error(names.stderr);
-    const parts = names.stdout.split("\0"), tracked = [];
-    for (let i = 0; i + 1 < parts.length && tracked.length < MAX_FILES; i += 2) {
-      if (parts[i + 1]) tracked.push({ path: parts[i + 1], status: letter(parts[i]), fresh: false, ...(stats[parts[i + 1]] ?? { add: 0, del: 0 }) });
-    }
-    files.unshift(...tracked);
+    files.unshift(...nameStatus(names.stdout, stats));
   }
   return { root, files, hasHead, against, base, baseName, limited: entries.length > MAX_FILES };
 }
 
 // Every file's diff as rows, a header row first per file. Returns null when nothing changed since `sig`.
-export async function loadDiffs({ root, on, files, hasHead, against }, sig) {
+// With `index` (since sent), the worktree against that index.
+export async function loadDiffs({ root, on, files, hasHead, against, index }, sig) {
   const direct = (f) => f.fresh || (!hasHead && f.status === "A");
   let raw = "";
   if (files.some((f) => !direct(f))) {
-    const r = await exec("git", [...READ, "-c", "core.quotePath=false", "diff", ...(hasHead ? [against] : []), "--no-ext-diff", "--no-textconv", "--no-color", "--no-renames"], { cwd: root, on });
+    const r = await gitAt(root, on, index)(["-c", "core.quotePath=false", "diff", ...(!index && hasHead ? [against] : []), "--no-ext-diff", "--no-textconv", "--no-color", "--no-renames"]);
     if (r.code !== 0) throw new Error(r.stderr);
     raw = r.stdout;
   }
